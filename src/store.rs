@@ -19,9 +19,6 @@ pub struct AgentFile {
     pub model: String,
     #[serde(default)]
     pub avatar: Option<String>,
-    /// Thinking mode: on (default) / auto / low / medium / high / off.
-    #[serde(default)]
-    pub think: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,7 +29,6 @@ pub struct Agent {
     pub avatar: Option<PathBuf>,
     /// Avatar file name relative to the agent folder (for rewriting agent.toml).
     pub avatar_file: Option<String>,
-    pub think: Option<String>,
     pub dir: PathBuf,
 }
 
@@ -67,16 +63,6 @@ pub fn ensure_seed() -> std::io::Result<()> {
     write_if_missing(
         &root.join("operator.md"),
         "# Operator\n\n",
-    )?;
-    write_if_missing(
-        &root.join("thinking.md"),
-        "# How to think\n\n\
-         Think in first person, in your own voice and character.\n\
-         Your reasoning is your inner monologue, not a report about\n\
-         yourself written by a stranger.\n\n\
-         Keep your thinking as short as the question deserves.\n\
-         Greetings and simple questions need a sentence or two at most.\n\
-         Save long reasoning for problems that are actually hard.\n",
     )?;
     if load_agents().is_empty() {
         let agent = create_agent("Bugchan", "qwen3.5:9b", "")?;
@@ -137,7 +123,6 @@ pub fn load_agents() -> Vec<Agent> {
             model: file.model,
             avatar,
             avatar_file,
-            think: file.think,
             dir,
         });
     }
@@ -193,7 +178,6 @@ pub fn create_agent(name: &str, model: &str, avatar_path: &str) -> std::io::Resu
             model.trim().to_string()
         },
         avatar: avatar_name,
-        think: None,
     };
     fs::write(dir.join("agent.toml"), toml::to_string(&file).unwrap_or_default())?;
     write_if_missing(
@@ -209,30 +193,21 @@ pub fn create_agent(name: &str, model: &str, avatar_path: &str) -> std::io::Resu
         model: file.model.clone(),
         avatar: file.avatar.as_ref().map(|a| dir.join(a)),
         avatar_file: file.avatar.clone(),
-        think: None,
         dir,
     })
 }
 
-/// Rewrite an agent's agent.toml from its current in-memory config.
-pub fn save_config(agent: &Agent) -> std::io::Result<()> {
+/// Persist a new model choice for an agent (rewrites its agent.toml).
+pub fn set_model(agent: &Agent, model: &str) -> std::io::Result<()> {
     let file = AgentFile {
         name: agent.name.clone(),
-        model: agent.model.clone(),
+        model: model.to_string(),
         avatar: agent.avatar_file.clone(),
-        think: agent.think.clone(),
     };
     fs::write(
         agent.dir.join("agent.toml"),
         toml::to_string(&file).unwrap_or_default(),
     )
-}
-
-/// Persist a new model choice for an agent.
-pub fn set_model(agent: &Agent, model: &str) -> std::io::Result<()> {
-    let mut updated = agent.clone();
-    updated.model = model.to_string();
-    save_config(&updated)
 }
 
 /// The body of a markdown file with its first heading line removed.
@@ -256,17 +231,11 @@ pub fn system_prompt(agent: &Agent) -> String {
     if !op.is_empty() {
         parts.push(format!("# About the operator\n{op}"));
     }
-    let persona = body_of(&agent.dir.join("persona.md"));
-    if !persona.is_empty() {
-        parts.push(format!("# Persona\n{persona}"));
-    }
-    // Shared reasoning house rules (data-dir thinking.md, user-editable;
-    // an empty or deleted file simply drops this section).
-    let thinking = body_of(&data_dir().join("thinking.md"));
-    if !thinking.is_empty() {
-        parts.push(format!("# How to think\n{thinking}"));
-    }
-    for (title, file) in [("Memory", "memory.md"), ("Lessons", "lessons.md")] {
+    for (title, file) in [
+        ("Persona", "persona.md"),
+        ("Memory", "memory.md"),
+        ("Lessons", "lessons.md"),
+    ] {
         let body = body_of(&agent.dir.join(file));
         if !body.is_empty() {
             parts.push(format!("# {title}\n{body}"));

@@ -20,39 +20,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 use store::Agent;
 
-const THINK_MODES: [&str; 6] = ["on", "auto", "low", "medium", "high", "off"];
-
-/// A short message with no hard-problem words counts as simple.
-fn is_simple(text: &str) -> bool {
-    if text.chars().count() > 90 {
-        return false;
-    }
-    let lower = text.to_lowercase();
-    const HARD: &[&str] = &[
-        "why", "how", "explain", "code", "debug", "error", "fix", "write", "plan", "compare",
-        "help", "create", "build", "story", "think",
-    ];
-    !HARD.iter().any(|w| lower.contains(w))
-}
-
-fn resolve_think(mode: Option<&str>, last_user: &str) -> ollama::Think {
-    match mode.unwrap_or("on") {
-        "off" => ollama::Think::Off,
-        "low" => ollama::Think::Level("low".to_string()),
-        "medium" => ollama::Think::Level("medium".to_string()),
-        "high" => ollama::Think::Level("high".to_string()),
-        // auto: small talk answers directly; real questions keep full thought.
-        "auto" => {
-            if is_simple(last_user) {
-                ollama::Think::Off
-            } else {
-                ollama::Think::Default
-            }
-        }
-        _ => ollama::Think::Default,
-    }
-}
-
 const MIN_W: u16 = 60;
 const MIN_H: u16 = 15;
 const PINK: Color = Color::Rgb(255, 121, 198);
@@ -162,7 +129,6 @@ impl App {
         if text.is_empty() || self.streaming {
             return;
         }
-        let think = resolve_think(agent.think.as_deref(), &text);
         self.chat_input.clear();
         self.chat.push(ChatMessage {
             role: "user".to_string(),
@@ -185,27 +151,8 @@ impl App {
         self.chat_rx = Some(rx);
         self.streaming = true;
         std::thread::spawn(move || {
-            ollama::stream_chat(agent.model.clone(), messages, think, tx);
+            ollama::stream_chat(agent.model.clone(), messages, tx);
         });
-    }
-
-    fn cycle_think(&mut self) {
-        let Some(agent) = self.agents.get_mut(self.selected) else {
-            return;
-        };
-        let current = agent.think.as_deref().unwrap_or("on");
-        let idx = THINK_MODES.iter().position(|m| *m == current).unwrap_or(0);
-        let next = THINK_MODES[(idx + 1) % THINK_MODES.len()];
-        agent.think = if next == "on" {
-            None
-        } else {
-            Some(next.to_string())
-        };
-        let (name, snapshot) = (agent.name.clone(), agent.clone());
-        match store::save_config(&snapshot) {
-            Ok(()) => self.status = format!("{name} thinking: {next} (saved)"),
-            Err(e) => self.status = format!("could not save thinking mode: {e}"),
-        }
     }
 
     fn ensure_avatar(&mut self, agent: &Agent) -> Option<&mut StatefulProtocol> {
@@ -325,7 +272,6 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                     }
                                 }
                             }
-                            KeyCode::Char('t') => app.cycle_think(),
                             KeyCode::Char('m') => app.screen = Screen::Models,
                             KeyCode::Char('r') => app.refresh_models(),
                             _ => {}
@@ -383,9 +329,6 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                     }
                     Screen::Chat => match key.code {
                         KeyCode::Esc => app.screen = Screen::Home,
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.cycle_think()
-                        }
                         KeyCode::Enter => app.send_chat(),
                         KeyCode::Backspace => {
                             app.chat_input.pop();
@@ -498,8 +441,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     let status = Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(DIM));
     f.render_widget(status, rows[2]);
     let hints = match app.screen {
-        Screen::Home => " ↑↓ pick · enter chat · e swap model · t thinking · n new agent · m models · r refresh · q quit",
-        Screen::Chat => " enter send · ctrl+t thinking mode · esc back · ctrl+c quit",
+        Screen::Home => " ↑↓ pick · enter chat · e swap model · n new agent · m models · r refresh · q quit",
+        Screen::Chat => " enter send · esc back · ctrl+c quit",
         Screen::Models => " r refresh · esc back",
         Screen::NewAgent => " tab next field · enter create (on last field) · esc cancel",
         Screen::PickModel => " ↑↓ pick · enter use this model · esc cancel",
@@ -586,10 +529,6 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled(format!(" {} ", agent.name), Style::default().fg(PINK).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" · {}", agent.model), Style::default().fg(DIM)),
-        Span::styled(
-            format!(" · think: {}", agent.think.as_deref().unwrap_or("on")),
-            Style::default().fg(DIM),
-        ),
         Span::styled(phase, Style::default().fg(DIM)),
     ]))
     .block(Block::default().borders(Borders::ALL));

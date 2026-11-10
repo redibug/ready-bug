@@ -73,9 +73,8 @@ Data lives in the platform data dir (Windows:
 
 ```
 operator.md            # shared profile of you, read by every agent
-thinking.md            # house rules for how agents reason (below)
 agents/<name>/
-  agent.toml           # name, model, avatar, think mode
+  agent.toml           # name, model, avatar
   avatar.png           # optional
   persona.md           # who this agent is
   memory.md            # what they've learned about you / your world
@@ -84,21 +83,3 @@ agents/<name>/
 
 An agent is a folder. Copy the folder, copy the agent. Edit any file
 in any text editor — Ready Bug reads them fresh each session.
-
-## Thinking
-
-Reasoning models stream their thought process live in chat (dimmed,
-marked 💭) before the answer. Two controls:
-
-- **`thinking.md`** sets the house style for reasoning — by default:
-  think in first person, in character, and keep it as short as the
-  question deserves. Edit it, or empty it to say nothing.
-- **Think mode** per agent, cycled with `t` on the home screen or
-  `ctrl+t` in chat, saved into `agent.toml`:
-  - `on` — the model's default (full reasoning)
-  - `auto` — simple messages (short, no hard-problem words like
-    "why" or "debug") answer directly with no thinking phase;
-    real questions think normally
-  - `low` / `medium` / `high` — effort levels, for models that
-    support them (e.g. gpt-oss)
-  - `off` — never think; fastest replies, plainest answers
