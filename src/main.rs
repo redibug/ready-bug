@@ -31,6 +31,7 @@ enum Screen {
     Chat,
     Models,
     NewAgent,
+    PickModel,
 }
 
 enum ModelsStatus {
@@ -52,6 +53,7 @@ struct App {
     chat_rx: Option<Receiver<ChatEvent>>,
     form: [String; 3], // name, model, avatar path
     form_focus: usize,
+    pick_selected: usize,
     status: String,
     picker: Picker,
     avatar_cache: Option<(String, StatefulProtocol)>,
@@ -181,6 +183,7 @@ fn main() -> std::io::Result<()> {
         chat_rx: None,
         form: [String::new(), String::new(), String::new()],
         form_focus: 0,
+        pick_selected: 0,
         status: format!("data: {}", store::data_dir().display()),
         picker: Picker::halfblocks(),
         avatar_cache: None,
@@ -234,6 +237,31 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                 app.form_focus = 0;
                                 app.screen = Screen::NewAgent;
                             }
+                            KeyCode::Char('e') => {
+                                if let Some(agent) = app.current_agent().cloned() {
+                                    match &app.models {
+                                        ModelsStatus::Ok(list) if !list.is_empty() => {
+                                            app.pick_selected = list
+                                                .iter()
+                                                .position(|m| m.name == agent.model)
+                                                .unwrap_or(0);
+                                            app.screen = Screen::PickModel;
+                                        }
+                                        ModelsStatus::Ok(_) => {
+                                            app.status =
+                                                "no models installed to pick from".to_string();
+                                        }
+                                        ModelsStatus::Loading => {
+                                            app.status = "still looking for ollama…".to_string();
+                                        }
+                                        ModelsStatus::Err(_) => {
+                                            app.status =
+                                                "ollama not detected — start it to swap models"
+                                                    .to_string();
+                                        }
+                                    }
+                                }
+                            }
                             KeyCode::Char('m') => app.screen = Screen::Models,
                             KeyCode::Char('r') => app.refresh_models(),
                             _ => {}
@@ -244,6 +272,51 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                         KeyCode::Char('r') => app.refresh_models(),
                         _ => {}
                     },
+                    Screen::PickModel => {
+                        let count = match &app.models {
+                            ModelsStatus::Ok(list) => list.len(),
+                            _ => 0,
+                        };
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Home,
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.pick_selected = app.pick_selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.pick_selected + 1 < count {
+                                    app.pick_selected += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let (Some(agent), ModelsStatus::Ok(list)) =
+                                    (app.current_agent().cloned(), &app.models)
+                                {
+                                    if let Some(chosen) = list.get(app.pick_selected) {
+                                        let model = chosen.name.clone();
+                                        match store::set_model(&agent, &model) {
+                                            Ok(()) => {
+                                                if let Some(a) =
+                                                    app.agents.get_mut(app.selected)
+                                                {
+                                                    a.model = model.clone();
+                                                }
+                                                app.status = format!(
+                                                    "{} now runs {} — saved",
+                                                    agent.name, model
+                                                );
+                                            }
+                                            Err(e) => {
+                                                app.status =
+                                                    format!("could not save model: {e}");
+                                            }
+                                        }
+                                        app.screen = Screen::Home;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     Screen::Chat => match key.code {
                         KeyCode::Esc => app.screen = Screen::Home,
                         KeyCode::Enter => app.send_chat(),
@@ -352,15 +425,17 @@ fn ui(f: &mut Frame, app: &mut App) {
         Screen::Chat => ui_chat(f, app, rows[1]),
         Screen::Models => ui_models(f, app, rows[1]),
         Screen::NewAgent => ui_new_agent(f, app, rows[1]),
+        Screen::PickModel => ui_pick_model(f, app, rows[1]),
     }
 
     let status = Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(DIM));
     f.render_widget(status, rows[2]);
     let hints = match app.screen {
-        Screen::Home => " ↑↓ pick · enter chat · n new agent · m models · r refresh · q quit",
+        Screen::Home => " ↑↓ pick · enter chat · e swap model · n new agent · m models · r refresh · q quit",
         Screen::Chat => " enter send · esc back · ctrl+c quit",
         Screen::Models => " r refresh · esc back",
         Screen::NewAgent => " tab next field · enter create (on last field) · esc cancel",
+        Screen::PickModel => " ↑↓ pick · enter use this model · esc cancel",
     };
     let footer = Paragraph::new(hints).style(Style::default().fg(DIM));
     f.render_widget(footer, rows[3]);
@@ -500,6 +575,40 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
     let input = Paragraph::new(format!("{}_", app.chat_input))
         .block(Block::default().borders(Borders::ALL).title(" message "));
     f.render_widget(input, rows[2]);
+}
+
+fn ui_pick_model(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(agent) = app.current_agent().cloned() else {
+        return;
+    };
+    let ModelsStatus::Ok(models) = &app.models else {
+        return;
+    };
+    let items: Vec<ListItem> = models
+        .iter()
+        .map(|m| {
+            let marker = if m.name == agent.model { "● current  " } else { "           " };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().fg(DIM)),
+                Span::styled(m.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  {}", ollama::format_size(m.size)),
+                    Style::default().fg(DIM),
+                ),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" swap model for {} ", agent.name)),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(PINK))
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(app.pick_selected.min(models.len().saturating_sub(1))));
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn ui_models(f: &mut Frame, app: &mut App, area: Rect) {

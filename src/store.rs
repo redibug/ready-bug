@@ -27,6 +27,8 @@ pub struct Agent {
     pub name: String,
     pub model: String,
     pub avatar: Option<PathBuf>,
+    /// Avatar file name relative to the agent folder (for rewriting agent.toml).
+    pub avatar_file: Option<String>,
     pub dir: PathBuf,
 }
 
@@ -112,11 +114,15 @@ pub fn load_agents() -> Vec<Agent> {
                     .map(|n| dir.join(n))
                     .find(|p| p.exists())
             });
+        let avatar_file = avatar
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
         agents.push(Agent {
             slug,
             name: file.name,
             model: file.model,
             avatar,
+            avatar_file,
             dir,
         });
     }
@@ -183,11 +189,25 @@ pub fn create_agent(name: &str, model: &str, avatar_path: &str) -> std::io::Resu
 
     Ok(Agent {
         slug,
-        name: file.name,
-        model: file.model,
+        name: file.name.clone(),
+        model: file.model.clone(),
         avatar: file.avatar.as_ref().map(|a| dir.join(a)),
+        avatar_file: file.avatar.clone(),
         dir,
     })
+}
+
+/// Persist a new model choice for an agent (rewrites its agent.toml).
+pub fn set_model(agent: &Agent, model: &str) -> std::io::Result<()> {
+    let file = AgentFile {
+        name: agent.name.clone(),
+        model: model.to_string(),
+        avatar: agent.avatar_file.clone(),
+    };
+    fs::write(
+        agent.dir.join("agent.toml"),
+        toml::to_string(&file).unwrap_or_default(),
+    )
 }
 
 /// The body of a markdown file with its first heading line removed.
