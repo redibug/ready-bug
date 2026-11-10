@@ -60,8 +60,19 @@ pub enum ChatEvent {
     Error(String),
 }
 
+/// How hard the model should think this turn.
+#[derive(Clone, Debug)]
+pub enum Think {
+    /// Don't send a think field at all — the model's own default.
+    Default,
+    /// `think: false` — answer directly, no reasoning phase.
+    Off,
+    /// `think: "low" | "medium" | "high"` — for models with effort levels.
+    Level(String),
+}
+
 /// Blocking streaming chat; run on a thread. Sends tokens as they arrive.
-pub fn stream_chat(model: String, messages: Vec<ChatMessage>, tx: Sender<ChatEvent>) {
+pub fn stream_chat(model: String, messages: Vec<ChatMessage>, think: Think, tx: Sender<ChatEvent>) {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
@@ -72,13 +83,19 @@ pub fn stream_chat(model: String, messages: Vec<ChatMessage>, tx: Sender<ChatEve
             return;
         }
     };
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+    });
+    match think {
+        Think::Default => {}
+        Think::Off => body["think"] = serde_json::json!(false),
+        Think::Level(level) => body["think"] = serde_json::json!(level),
+    }
     let resp = client
         .post(format!("{}/api/chat", base_url()))
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-        }))
+        .json(&body)
         .send();
     let resp = match resp {
         Ok(r) => r,
