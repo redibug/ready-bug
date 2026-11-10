@@ -99,7 +99,19 @@ pub fn load_agents() -> Vec<Agent> {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let avatar = file.avatar.as_ref().map(|a| dir.join(a)).filter(|p| p.exists());
+        // agent.toml may name the avatar; otherwise any avatar.<ext> file
+        // dropped into the folder counts — that's what the UI tells users.
+        let avatar = file
+            .avatar
+            .as_ref()
+            .map(|a| dir.join(a))
+            .filter(|p| p.exists())
+            .or_else(|| {
+                ["avatar.png", "avatar.jpg", "avatar.jpeg", "avatar.webp", "avatar.gif", "avatar.bmp"]
+                    .iter()
+                    .map(|n| dir.join(n))
+                    .find(|p| p.exists())
+            });
         agents.push(Agent {
             slug,
             name: file.name,
