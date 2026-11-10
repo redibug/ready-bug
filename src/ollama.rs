@@ -47,10 +47,15 @@ pub fn fetch_models() -> Result<Vec<ModelInfo>, String> {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Reasoning text (Ollama's separate `thinking` field). Display-only:
+    /// never sent back to the model in later turns.
+    #[serde(default, skip_serializing)]
+    pub thinking: String,
 }
 
 pub enum ChatEvent {
     Token(String),
+    Thinking(String),
     Done,
     Error(String),
 }
@@ -104,6 +109,11 @@ pub fn stream_chat(model: String, messages: Vec<ChatMessage>, tx: Sender<ChatEve
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        if let Some(thinking) = v["message"]["thinking"].as_str() {
+            if !thinking.is_empty() {
+                let _ = tx.send(ChatEvent::Thinking(thinking.to_string()));
+            }
+        }
         if let Some(content) = v["message"]["content"].as_str() {
             if !content.is_empty() {
                 let _ = tx.send(ChatEvent::Token(content.to_string()));

@@ -89,6 +89,13 @@ impl App {
                             }
                         }
                     }
+                    Ok(ChatEvent::Thinking(tok)) => {
+                        if let Some(last) = self.chat.last_mut() {
+                            if last.role == "assistant" {
+                                last.thinking.push_str(&tok);
+                            }
+                        }
+                    }
                     Ok(ChatEvent::Done) => {
                         self.streaming = false;
                         break;
@@ -126,14 +133,17 @@ impl App {
         self.chat.push(ChatMessage {
             role: "user".to_string(),
             content: text,
+            thinking: String::new(),
         });
         self.chat.push(ChatMessage {
             role: "assistant".to_string(),
             content: String::new(),
+            thinking: String::new(),
         });
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
             content: store::system_prompt(&agent),
+            thinking: String::new(),
         }];
         // History without the empty assistant placeholder.
         messages.extend(self.chat.iter().take(self.chat.len() - 1).cloned());
@@ -503,10 +513,23 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(3),
     ])
     .split(area);
+    let phase = if !app.streaming {
+        ""
+    } else if let Some(last) = app.chat.last().filter(|m| m.role == "assistant") {
+        if !last.content.is_empty() {
+            " · receiving…"
+        } else if !last.thinking.is_empty() {
+            " · thinking…"
+        } else {
+            " · waiting…"
+        }
+    } else {
+        " · waiting…"
+    };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(format!(" {} ", agent.name), Style::default().fg(PINK).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" · {}", agent.model), Style::default().fg(DIM)),
-        Span::styled(if app.streaming { " · receiving…" } else { "" }, Style::default().fg(DIM)),
+        Span::styled(phase, Style::default().fg(DIM)),
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, rows[0]);
@@ -526,7 +549,24 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             (agent.name.clone(), PINK)
         };
-        let text = if msg.content.is_empty() && app.streaming {
+        if !msg.thinking.is_empty() {
+            let mut first = true;
+            for part in msg.thinking.split('\n') {
+                if first {
+                    lines.push(Line::from(Span::styled(
+                        format!("💭 {part}"),
+                        Style::default().fg(DIM),
+                    )));
+                    first = false;
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {part}"),
+                        Style::default().fg(DIM),
+                    )));
+                }
+            }
+        }
+        let text = if msg.content.is_empty() && msg.thinking.is_empty() && app.streaming {
             "…".to_string()
         } else {
             msg.content.clone()
