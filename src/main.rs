@@ -32,6 +32,38 @@ enum Screen {
     Models,
     NewAgent,
     PickModel,
+    PickRouter,
+}
+
+struct RouterRow {
+    label: String,
+    /// None = the "no routing" row.
+    value: Option<String>,
+}
+
+/// The state handed to a router: the agent's models, which one is
+/// current, a trimmed window of recent history, and the new message.
+fn route_state(agent: &Agent, chat: &[ChatMessage], new_text: &str) -> String {
+    let mut s = format!(
+        "Models (priority order): {}\nCurrent model: {}\n\nRecent conversation:\n",
+        agent.models.join(", "),
+        agent.model
+    );
+    let recent: Vec<&ChatMessage> = chat
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .rev()
+        .take(4)
+        .collect();
+    for m in recent.iter().rev() {
+        if m.content.is_empty() {
+            continue;
+        }
+        let trimmed: String = m.content.chars().take(240).collect();
+        s.push_str(&format!("{}: {}\n", m.role, trimmed));
+    }
+    s.push_str(&format!("\nNew message:\n{new_text}"));
+    s
 }
 
 enum ModelsStatus {
@@ -54,6 +86,11 @@ struct App {
     form: [String; 3], // name, model, avatar path
     form_focus: usize,
     pick_selected: usize,
+    routing: bool,
+    last_model: Option<String>,
+    router_rows: Option<Vec<RouterRow>>,
+    router_rx: Option<Receiver<Vec<RouterRow>>>,
+    pick_router_selected: usize,
     status: String,
     picker: Picker,
     avatar_cache: Option<(String, StatefulProtocol)>,
@@ -96,8 +133,26 @@ impl App {
                             }
                         }
                     }
+                    Ok(ChatEvent::Routed {
+                        model,
+                        think_label,
+                        router,
+                    }) => {
+                        self.routing = false;
+                        self.last_model = Some(model.clone());
+                        self.status = format!("routed by {router} → {model} · think {think_label}");
+                        // The routed model becomes the agent's current model.
+                        if let Some(a) = self.agents.get_mut(self.selected) {
+                            if a.model != model {
+                                a.model = model;
+                                let snapshot = a.clone();
+                                let _ = store::save_config(&snapshot);
+                            }
+                        }
+                    }
                     Ok(ChatEvent::Done) => {
                         self.streaming = false;
+                        self.routing = false;
                         break;
                     }
                     Ok(ChatEvent::Error(e)) => {
@@ -110,6 +165,7 @@ impl App {
                             }
                         }
                         self.streaming = false;
+                        self.routing = false;
                         break;
                     }
                     Err(_) => break,
@@ -118,6 +174,12 @@ impl App {
         }
         if !self.streaming {
             self.chat_rx = None;
+        }
+        if let Some(rx) = &self.router_rx {
+            if let Ok(rows) = rx.try_recv() {
+                self.router_rows = Some(rows);
+                self.router_rx = None;
+            }
         }
     }
 
@@ -129,6 +191,7 @@ impl App {
         if text.is_empty() || self.streaming {
             return;
         }
+        let state = route_state(&agent, &self.chat, &text);
         self.chat_input.clear();
         self.chat.push(ChatMessage {
             role: "user".to_string(),
@@ -150,8 +213,72 @@ impl App {
         let (tx, rx) = channel();
         self.chat_rx = Some(rx);
         self.streaming = true;
+        self.routing = agent.router.is_some();
         std::thread::spawn(move || {
-            ollama::stream_chat(agent.model.clone(), messages, tx);
+            // Route first (if this agent has a router), then stream the
+            // answer from the chosen model. Any routing failure quietly
+            // falls back to the current model at full default thinking.
+            let (use_model, think) = match &agent.router {
+                Some(router) => {
+                    let routed = ollama::router_kind(router)
+                        .and_then(|kind| ollama::route(router, kind, &state, &agent.models, &agent.model));
+                    match routed {
+                        Ok(d) => {
+                            let _ = tx.send(ChatEvent::Routed {
+                                model: d.model.clone(),
+                                think_label: ollama::think_label(&d.think),
+                                router: router.clone(),
+                            });
+                            (d.model, d.think)
+                        }
+                        Err(_) => (agent.model.clone(), ollama::Think::Default),
+                    }
+                }
+                None => (agent.model.clone(), ollama::Think::Default),
+            };
+            ollama::stream_chat(use_model, messages, think, tx);
+        });
+    }
+
+    fn open_router_picker(&mut self) {
+        let names: Vec<String> = match &self.models {
+            ModelsStatus::Ok(list) => list.iter().map(|m| m.name.clone()).collect(),
+            ModelsStatus::Loading => {
+                self.status = "still looking for ollama…".to_string();
+                return;
+            }
+            ModelsStatus::Err(_) => {
+                self.status = "ollama not detected — can't list router models".to_string();
+                return;
+            }
+        };
+        self.router_rows = None;
+        self.pick_router_selected = 0;
+        self.screen = Screen::PickRouter;
+        let (tx, rx) = channel();
+        self.router_rx = Some(rx);
+        std::thread::spawn(move || {
+            let mut rows = vec![RouterRow {
+                label: "none — no routing".to_string(),
+                value: None,
+            }];
+            for name in names {
+                let tag = match ollama::router_kind(&name) {
+                    Ok(ollama::RouterKind::Decision) => "decision",
+                    Ok(ollama::RouterKind::Text) => "chat",
+                    Err(_) => "?",
+                };
+                let default = if name == store::DEFAULT_ROUTER {
+                    " · default"
+                } else {
+                    ""
+                };
+                rows.push(RouterRow {
+                    label: format!("{name}  [{tag}]{default}"),
+                    value: Some(name),
+                });
+            }
+            let _ = tx.send(rows);
         });
     }
 
@@ -194,6 +321,11 @@ fn main() -> std::io::Result<()> {
         form: [String::new(), String::new(), String::new()],
         form_focus: 0,
         pick_selected: 0,
+        routing: false,
+        last_model: None,
+        router_rows: None,
+        router_rx: None,
+        pick_router_selected: 0,
         status: format!("data: {}", store::data_dir().display()),
         picker: Picker::halfblocks(),
         avatar_cache: None,
@@ -229,16 +361,19 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                             KeyCode::Char('q') => break,
                             KeyCode::Up | KeyCode::Char('k') => {
                                 app.selected = app.selected.saturating_sub(1);
+                                app.last_model = None;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if app.selected + 1 < app.agents.len() {
                                     app.selected += 1;
                                 }
+                                app.last_model = None;
                             }
                             KeyCode::Enter => {
                                 if app.current_agent().is_some() {
                                     app.chat.clear();
                                     app.chat_input.clear();
+                                    app.last_model = None;
                                     app.screen = Screen::Chat;
                                 }
                             }
@@ -272,6 +407,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                     }
                                 }
                             }
+                            KeyCode::Char('R') => app.open_router_picker(),
                             KeyCode::Char('m') => app.screen = Screen::Models,
                             KeyCode::Char('r') => app.refresh_models(),
                             _ => {}
@@ -309,6 +445,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                                     app.agents.get_mut(app.selected)
                                                 {
                                                     a.model = model.clone();
+                                                    a.models.retain(|m| m != &model);
+                                                    a.models.insert(0, model.clone());
                                                 }
                                                 app.status = format!(
                                                     "{} now runs {} — saved",
@@ -318,6 +456,51 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                             Err(e) => {
                                                 app.status =
                                                     format!("could not save model: {e}");
+                                            }
+                                        }
+                                        app.screen = Screen::Home;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Screen::PickRouter => {
+                        let count = app.router_rows.as_ref().map(|r| r.len()).unwrap_or(0);
+                        match key.code {
+                            KeyCode::Esc => app.screen = Screen::Home,
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.pick_router_selected =
+                                    app.pick_router_selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.pick_router_selected + 1 < count {
+                                    app.pick_router_selected += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(rows) = &app.router_rows {
+                                    if let Some(row) = rows.get(app.pick_router_selected) {
+                                        let value = row.value.clone();
+                                        if let Some(a) = app.agents.get_mut(app.selected) {
+                                            a.router = value.clone();
+                                            let (name, snapshot) =
+                                                (a.name.clone(), a.clone());
+                                            match store::save_config(&snapshot) {
+                                                Ok(()) => {
+                                                    app.status = match &value {
+                                                        Some(r) => format!(
+                                                            "{name} router: {r} (saved)"
+                                                        ),
+                                                        None => format!(
+                                                            "{name} routing off (saved)"
+                                                        ),
+                                                    };
+                                                }
+                                                Err(e) => {
+                                                    app.status =
+                                                        format!("could not save router: {e}");
+                                                }
                                             }
                                         }
                                         app.screen = Screen::Home;
@@ -436,16 +619,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         Screen::Models => ui_models(f, app, rows[1]),
         Screen::NewAgent => ui_new_agent(f, app, rows[1]),
         Screen::PickModel => ui_pick_model(f, app, rows[1]),
+        Screen::PickRouter => ui_pick_router(f, app, rows[1]),
     }
 
     let status = Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(DIM));
     f.render_widget(status, rows[2]);
     let hints = match app.screen {
-        Screen::Home => " ↑↓ pick · enter chat · e swap model · n new agent · m models · r refresh · q quit",
+        Screen::Home => " ↑↓ pick · enter chat · e swap model · R router · n new agent · m models · r refresh · q quit",
         Screen::Chat => " enter send · esc back · ctrl+c quit",
         Screen::Models => " r refresh · esc back",
         Screen::NewAgent => " tab next field · enter create (on last field) · esc cancel",
         Screen::PickModel => " ↑↓ pick · enter use this model · esc cancel",
+        Screen::PickRouter => " ↑↓ pick · enter use this router · esc cancel",
     };
     let footer = Paragraph::new(hints).style(Style::default().fg(DIM));
     f.render_widget(footer, rows[3]);
@@ -493,8 +678,23 @@ fn ui_home(f: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().fg(DIM));
         f.render_widget(p, parts[0]);
     }
+    let router_text = match &agent.router {
+        Some(r) => {
+            let installed = match &app.models {
+                ModelsStatus::Ok(list) => Some(list.iter().any(|m| &m.name == r)),
+                _ => None,
+            };
+            match installed {
+                Some(false) => format!("{r} (not installed)"),
+                _ => r.clone(),
+            }
+        }
+        None => "none".to_string(),
+    };
     let info = Paragraph::new(vec![
         Line::from(vec![Span::styled("model: ", Style::default().fg(DIM)), Span::raw(agent.model.clone())]),
+        Line::from(vec![Span::styled("router: ", Style::default().fg(DIM)), Span::raw(router_text)]),
+        Line::from(vec![Span::styled("models: ", Style::default().fg(DIM)), Span::raw(agent.models.join(", "))]),
         Line::from(vec![Span::styled("files: ", Style::default().fg(DIM)), Span::raw(agent.dir.display().to_string())]),
         Line::from(""),
         Line::from(Span::styled("persona, memory + lessons load into every chat.", Style::default().fg(DIM))),
@@ -515,6 +715,8 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
     .split(area);
     let phase = if !app.streaming {
         ""
+    } else if app.routing {
+        " · routing…"
     } else if let Some(last) = app.chat.last().filter(|m| m.role == "assistant") {
         if !last.content.is_empty() {
             " · receiving…"
@@ -528,7 +730,10 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(format!(" {} ", agent.name), Style::default().fg(PINK).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {}", agent.model), Style::default().fg(DIM)),
+        Span::styled(
+            format!(" · {}", app.last_model.clone().unwrap_or_else(|| agent.model.clone())),
+            Style::default().fg(DIM),
+        ),
         Span::styled(phase, Style::default().fg(DIM)),
     ]))
     .block(Block::default().borders(Borders::ALL));
@@ -648,6 +853,42 @@ fn ui_pick_model(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▸ ");
     let mut state = ListState::default();
     state.select(Some(app.pick_selected.min(models.len().saturating_sub(1))));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn ui_pick_router(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(agent) = app.current_agent().cloned() else {
+        return;
+    };
+    let Some(rows) = &app.router_rows else {
+        let p = Paragraph::new("asking ollama what each model is…")
+            .block(Block::default().borders(Borders::ALL).title(" router "));
+        f.render_widget(p, area);
+        return;
+    };
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let current = row.value == agent.router;
+            let marker = if current { "● current  " } else { "           " };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().fg(DIM)),
+                Span::raw(row.label.clone()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" router for {} ", agent.name)),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(PINK))
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(
+        app.pick_router_selected.min(rows.len().saturating_sub(1)),
+    ));
     f.render_stateful_widget(list, area, &mut state);
 }
 

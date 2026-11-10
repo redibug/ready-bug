@@ -74,7 +74,7 @@ Data lives in the platform data dir (Windows:
 ```
 operator.md            # shared profile of you, read by every agent
 agents/<name>/
-  agent.toml           # name, model, avatar
+  agent.toml           # name, model, avatar, models, router
   avatar.png           # optional
   persona.md           # who this agent is
   memory.md            # what they've learned about you / your world
@@ -83,3 +83,39 @@ agents/<name>/
 
 An agent is a folder. Copy the folder, copy the agent. Edit any file
 in any text editor — Ready Bug reads them fresh each session.
+
+## Model routing
+
+An agent can carry several models and let a small **router** model
+pick which one answers each message — and whether that message
+deserves step-by-step thinking, and at what effort. The agent's
+persona, memory, and lessons never change; only the engine under
+them does.
+
+Two lines in `agent.toml` control it:
+
+```toml
+models = ["qwen3.5:9b", "gpt-oss:20b"]   # the router's choices, in priority order
+router = "tev1:0.8b"                     # who decides (default if omitted)
+```
+
+- **No `models`** → the list is just the agent's `model`.
+- **No `router`** → the default router, `tev1:0.8b`. Pull it once
+  (`ollama pull tev1:0.8b`, ~0.8 GB) and routing works out of the box.
+- **`router = "none"`** → no routing; the first model always answers.
+- Pick the router in the app instead: press **R** on the home screen.
+  Chat models and decision models both appear, labeled by type.
+
+The router can be either kind of model:
+
+- A **decision model** (Jev-style, e.g. `tev1`, `nimble`) answers
+  typed questions — model choice, yes/no thinking, effort score —
+  in a single fast pass, with probabilities. Needs Ollama 0.35+.
+- A **chat model** is asked for the same verdict as JSON.
+
+Either way: the current model is preferred — a switch has to win by
+a real margin, so routing never thrashes between models. The router
+sees a short window of recent conversation, not the agent's system
+prompt. If the router is missing or fails, the chat quietly falls
+back to the current model. Pressing **e** still swaps the home model
+manually, and whichever model answered last becomes the current one.

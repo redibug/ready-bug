@@ -13,12 +13,22 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Router used when an agent's agent.toml doesn't name one.
+pub const DEFAULT_ROUTER: &str = "tev1:0.8b";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentFile {
     pub name: String,
     pub model: String,
     #[serde(default)]
     pub avatar: Option<String>,
+    /// Models the router may pick from (priority order). Missing = [model].
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+    /// Router model (a chat model or a decision model). Missing = default
+    /// router; "none" = routing off.
+    #[serde(default)]
+    pub router: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,7 +39,27 @@ pub struct Agent {
     pub avatar: Option<PathBuf>,
     /// Avatar file name relative to the agent folder (for rewriting agent.toml).
     pub avatar_file: Option<String>,
+    /// Models the router may pick from, in priority order. Never empty.
+    pub models: Vec<String>,
+    /// Effective router (None = routing off).
+    pub router: Option<String>,
     pub dir: PathBuf,
+}
+
+/// Missing router field → the default router; "none"/"" → routing off.
+fn resolve_router(raw: &Option<String>) -> Option<String> {
+    match raw {
+        None => Some(DEFAULT_ROUTER.to_string()),
+        Some(s) if s.trim().is_empty() || s.trim().eq_ignore_ascii_case("none") => None,
+        Some(s) => Some(s.trim().to_string()),
+    }
+}
+
+fn resolve_models(raw: &Option<Vec<String>>, model: &str) -> Vec<String> {
+    match raw {
+        Some(list) if !list.is_empty() => list.clone(),
+        _ => vec![model.to_string()],
+    }
 }
 
 pub fn data_dir() -> PathBuf {
@@ -117,12 +147,16 @@ pub fn load_agents() -> Vec<Agent> {
         let avatar_file = avatar
             .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        let models = resolve_models(&file.models, &file.model);
+        let router = resolve_router(&file.router);
         agents.push(Agent {
             slug,
             name: file.name,
             model: file.model,
             avatar,
             avatar_file,
+            models,
+            router,
             dir,
         });
     }
@@ -178,6 +212,8 @@ pub fn create_agent(name: &str, model: &str, avatar_path: &str) -> std::io::Resu
             model.trim().to_string()
         },
         avatar: avatar_name,
+        models: None,
+        router: None,
     };
     fs::write(dir.join("agent.toml"), toml::to_string(&file).unwrap_or_default())?;
     write_if_missing(
@@ -193,21 +229,40 @@ pub fn create_agent(name: &str, model: &str, avatar_path: &str) -> std::io::Resu
         model: file.model.clone(),
         avatar: file.avatar.as_ref().map(|a| dir.join(a)),
         avatar_file: file.avatar.clone(),
+        models: resolve_models(&file.models, &file.model),
+        router: resolve_router(&file.router),
         dir,
     })
 }
 
-/// Persist a new model choice for an agent (rewrites its agent.toml).
-pub fn set_model(agent: &Agent, model: &str) -> std::io::Result<()> {
+/// Rewrite an agent's agent.toml from its current in-memory config.
+pub fn save_config(agent: &Agent) -> std::io::Result<()> {
     let file = AgentFile {
         name: agent.name.clone(),
-        model: model.to_string(),
+        model: agent.model.clone(),
         avatar: agent.avatar_file.clone(),
+        models: Some(agent.models.clone()),
+        router: Some(
+            agent
+                .router
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
     };
     fs::write(
         agent.dir.join("agent.toml"),
         toml::to_string(&file).unwrap_or_default(),
     )
+}
+
+/// Persist a new model choice for an agent; the chosen model also moves
+/// to the front of its routing list.
+pub fn set_model(agent: &Agent, model: &str) -> std::io::Result<()> {
+    let mut updated = agent.clone();
+    updated.model = model.to_string();
+    updated.models.retain(|m| m != model);
+    updated.models.insert(0, model.to_string());
+    save_config(&updated)
 }
 
 /// The body of a markdown file with its first heading line removed.
