@@ -20,8 +20,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 use store::Agent;
 
-const MIN_W: u16 = 60;
-const MIN_H: u16 = 15;
 const PINK: Color = Color::Rgb(255, 121, 198);
 const DIM: Color = Color::Rgb(140, 140, 160);
 
@@ -584,16 +582,9 @@ fn ollama_status(app: &App) -> (String, Color) {
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    // No minimum-size gate: render at whatever size the terminal is.
+    // Layout may look squished when tiny, but it always displays.
     let area = f.area();
-    if area.width < MIN_W || area.height < MIN_H {
-        let msg = format!("too small! needs {MIN_W}x{MIN_H}, is {}x{}", area.width, area.height);
-        let p = Paragraph::new(msg)
-            .style(Style::default().fg(PINK))
-            .alignment(ratatui::layout::Alignment::Center);
-        let mid = Rect { x: 0, y: area.height / 2, width: area.width, height: 1 };
-        f.render_widget(p, mid);
-        return;
-    }
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
