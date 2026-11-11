@@ -148,6 +148,16 @@ impl App {
                             }
                         }
                     }
+                    Ok(ChatEvent::RouterFailed { router, reason }) => {
+                        self.routing = false;
+                        let fallback = self
+                            .current_agent()
+                            .map(|a| a.model.clone())
+                            .unwrap_or_default();
+                        self.status = format!(
+                            "router {router} failed ({reason}) — using {fallback}"
+                        );
+                    }
                     Ok(ChatEvent::Done) => {
                         self.streaming = false;
                         self.routing = false;
@@ -214,8 +224,9 @@ impl App {
         self.routing = agent.router.is_some();
         std::thread::spawn(move || {
             // Route first (if this agent has a router), then stream the
-            // answer from the chosen model. Any routing failure quietly
-            // falls back to the current model at full default thinking.
+            // answer from the chosen model. Any routing failure falls back
+            // to the current model at full default thinking, and reports
+            // itself via a RouterFailed event so it is visible, not silent.
             let (use_model, think) = match &agent.router {
                 Some(router) => {
                     let routed = ollama::router_kind(router)
@@ -229,7 +240,13 @@ impl App {
                             });
                             (d.model, d.think)
                         }
-                        Err(_) => (agent.model.clone(), ollama::Think::Default),
+                        Err(e) => {
+                            let _ = tx.send(ChatEvent::RouterFailed {
+                                router: router.clone(),
+                                reason: e,
+                            });
+                            (agent.model.clone(), ollama::Think::Default)
+                        }
                     }
                 }
                 None => (agent.model.clone(), ollama::Think::Default),

@@ -62,6 +62,13 @@ pub enum ChatEvent {
         think_label: String,
         router: String,
     },
+    /// The router failed (not installed, old Ollama, unreachable, bad
+    /// reply). Chat still falls back to the current model — this event
+    /// exists only so the failure is visible instead of silent.
+    RouterFailed {
+        router: String,
+        reason: String,
+    },
     Done,
     Error(String),
 }
