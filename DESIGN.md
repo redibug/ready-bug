@@ -180,10 +180,15 @@ Future games/apps must NOT each carry their own copy of the setup
 logic (prereqs, comfy workspace, daemon, shared library). Instead:
 
 - **Split the crate**: a `readybug-core` library (the comfy module,
-  the ollama client, paths — everything UI-free) + the TUI binary +
-  a **`readybug` CLI** binary. Games depend on the library for
-  runtime questions (where's the workspace? is the daemon up?) and
-  shell out to the CLI for setup.
+  the ollama client, paths — everything UI-free) + **ONE binary**,
+  `readybug`, with two front doors: bare `readybug` opens the TUI,
+  any subcommand is the CLI. (Mel, 2026-11-12: two binaries named
+  ready-bug/readybug was needlessly confusing; one app, argv
+  dispatch — NOT the TUI shelling out to the CLI, it still calls
+  the library in-process.) Games depend on the library for runtime
+  questions (where's the workspace? is the daemon up?) and shell
+  out to the CLI commands for setup. A bare `readybug` with no
+  terminal attached prints the usage text instead of the TUI.
 - **`readybug install`** (the CLI's centerpiece): idempotent
   bootstrap — check/install prerequisites (**Ollama**, **Python
   3.13**, **comfy-cli**), then run the exact comfy install the TUI
@@ -200,9 +205,10 @@ logic (prereqs, comfy workspace, daemon, shared library). Instead:
 - CLI sketch: `install`, `doctor` (what's present/missing),
   `comfy status|launch|stop`, `--version`; `--json` on the
   reporting commands since games are the consumers.
-- Status: **SHIPPED 2026-11-12 (v0.2.0)** on Mel's word. Single
-  package, three targets: `ready_bug` lib (comfy, ollama, setup),
-  the TUI bin, and `src/bin/readybug.rs`. Prereq installs live in
+- Status: **SHIPPED 2026-11-12 (v0.2.0; merged to one binary in
+  v0.3.0 the same day)** on Mel's word. Single package: the
+  `ready_bug` lib (comfy, ollama, setup) + the `readybug` binary
+  (TUI in main.rs, CLI in cli.rs, dispatched on argv). Prereq installs live in
   `setup.rs`: checks + per-user install routes (winget for Ollama
   and Python 3.13 on Windows, brew on macOS, the official script
   for Ollama on Linux; comfy-cli via pip), each step verified by

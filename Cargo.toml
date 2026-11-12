@@ -1,10 +1,13 @@
 [package]
 name = "ready-bug"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Ready Bug — an agent-first local AI command center (ratatui TUI, Ollama, ComfyUI)"
 license = "MIT"
-default-run = "ready-bug"
+
+[[bin]]
+name = "readybug"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30.2"

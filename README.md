@@ -53,8 +53,8 @@ cargo run              # debug build — fine for testing
 
 ```powershell
 cargo build --release  # optimized build
-.\target\release\ready-bug.exe   # Windows
-./target/release/ready-bug       # Linux/macOS
+.\target\release\readybug.exe   # Windows
+./target/release/readybug         # Linux/macOS
 ```
 
 First `cargo run` downloads the libraries and compiles everything
@@ -62,11 +62,13 @@ First `cargo run` downloads the libraries and compiles everything
 
 ## The `readybug` CLI (for games & scripts)
 
-The same codebase also builds a small CLI, `readybug` — the shared
-setup surface so other programs (our text adventure games, future
-apps) never carry their own copy of the install logic:
+It's ONE binary with two front doors: bare `readybug` opens the
+app above; any subcommand is the CLI — the shared setup surface so
+other programs (our text adventure games, future apps) never carry
+their own copy of the install logic:
 
 ```bash
+readybug                  # the app (in a terminal)
 readybug install          # prerequisites (Ollama, Python 3.13, comfy-cli)
                           # + ComfyUI into the shared workspace + link the
                           # Comfy Desktop shared model library
@@ -77,8 +79,7 @@ readybug comfy stop       # stop it
 ```
 
 Games depend on the `ready_bug` library for runtime questions and
-shell out to this CLI for setup. Building both binaries is just
-`cargo build` (they land in `target/<profile>/` together).
+shell out to the CLI commands for setup.
 
 **Tips**
 

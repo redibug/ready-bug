@@ -3,6 +3,7 @@
 //! Screens: Agents (home) · Chat · Models (Ollama) · Media (ComfyUI) · New Agent.
 //! See DESIGN.md for where this is all going.
 
+mod cli;
 mod store;
 use ready_bug::{comfy, ollama};
 
@@ -432,7 +433,32 @@ impl App {
     }
 }
 
+/// One binary, two front doors (Mel's call, 2026-11-12): bare
+/// `readybug` opens the app; any subcommand is the CLI. The split
+/// was never about two programs — one name, one download, and the
+/// TUI still calls the library in-process.
 fn main() -> std::io::Result<()> {
+    use std::io::IsTerminal;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(|s| s.as_str()) {
+        None | Some("tui") => {
+            if !std::io::stdin().is_terminal() {
+                // A game or script calling bare `readybug` gets the
+                // usage text, not a TUI sprayed into a pipe.
+                if args.is_empty() {
+                    cli::usage();
+                } else {
+                    eprintln!("readybug: the app needs a terminal");
+                }
+                std::process::exit(2);
+            }
+            run_tui()
+        }
+        Some(_) => std::process::exit(cli::run(&args)),
+    }
+}
+
+fn run_tui() -> std::io::Result<()> {
     if let Err(e) = store::ensure_seed() {
         eprintln!("warning: could not prepare data dir: {e}");
     }

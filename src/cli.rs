@@ -13,11 +13,13 @@ use std::sync::mpsc::{channel, Sender};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn usage() {
+pub fn usage() {
     println!(
         "readybug {VERSION} — shared local-AI setup & ComfyUI control
 
 USAGE:
+    readybug                launch the app (in a terminal)
+    readybug tui            same, explicitly
     readybug install            install prerequisites (Ollama, Python 3.13,
                                 comfy-cli), then install ComfyUI into the
                                 shared ReadyBug workspace and link the
@@ -205,11 +207,14 @@ fn install() -> i32 {
     0
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: &[String]) -> i32 {
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let code = match strs.as_slice() {
-        [] | ["--help"] | ["-h"] | ["help"] => {
+    match strs.as_slice() {
+        [] => {
+            usage();
+            0
+        }
+        ["--help"] | ["-h"] | ["help"] => {
             usage();
             0
         }
@@ -247,6 +252,5 @@ fn main() {
             usage();
             2
         }
-    };
-    std::process::exit(code);
+    }
 }
