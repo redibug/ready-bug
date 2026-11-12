@@ -23,6 +23,11 @@ See [DESIGN.md](DESIGN.md) for the full design.
   Desktop's shared model library (writes `extra_model_paths.yaml`),
   and browse every image/video model the scanner finds there.
   Duplicate files are flagged, never deleted — your files, your call.
+- Mouse support: click an agent to select it, click it again to
+  open its chat; the model/router pickers and the Media list work
+  the same way. The wheel scrolls everywhere, and PageUp/PageDown
+  scroll chat history and lists by the page. Every keyboard
+  shortcut still works exactly as before.
 
 Coming later (per DESIGN.md): Ollama model browser + pull/delete,
 ComfyUI generation, video.

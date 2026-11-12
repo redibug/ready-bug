@@ -7,7 +7,10 @@ mod cli;
 mod store;
 use ready_bug::{comfy, ollama};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use ollama::{ChatEvent, ChatMessage, ModelInfo};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -95,6 +98,19 @@ struct App {
     media_busy: Option<String>,
     media_log: Vec<String>,
     media_selected: usize,
+    // Mouse + scroll state (2026-11-12). chat_scroll is in display
+    // lines above the bottom (0 = pinned to the latest); the hit
+    // rects/offsets are stashed by the renderers for click mapping.
+    chat_scroll: usize,
+    chat_page: usize,
+    chat_max_scroll: usize,
+    models_scroll: usize,
+    hit_home_list: Rect,
+    hit_home_offset: usize,
+    hit_pick_list: Rect,
+    hit_pick_offset: usize,
+    hit_media_list: Rect,
+    hit_media_offset: usize,
     chat: Vec<ChatMessage>,
     chat_input: String,
     streaming: bool,
@@ -167,6 +183,208 @@ impl App {
         let excess = self.media_log.len().saturating_sub(60);
         if excess > 0 {
             self.media_log.drain(..excess);
+        }
+    }
+
+    // --------------------------------------------------------------
+    // Mouse (2026-11-12, Mel's ask): click to select, click the
+    // selected row again to confirm/open, wheel to scroll. Keyboard
+    // paths are untouched and share these same action methods.
+    // --------------------------------------------------------------
+
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_click(m.column, m.row),
+            MouseEventKind::ScrollUp => self.mouse_scroll(true),
+            MouseEventKind::ScrollDown => self.mouse_scroll(false),
+            _ => {}
+        }
+    }
+
+    /// Map a click inside a bordered list rect to an item index,
+    /// accounting for the border and the list's scroll offset.
+    fn row_in(&self, rect: Rect, offset: usize, col: u16, row: u16) -> Option<usize> {
+        if rect.width < 2 || rect.height < 2 {
+            return None;
+        }
+        if col <= rect.x || row <= rect.y {
+            return None;
+        }
+        if col >= rect.x + rect.width - 1 || row >= rect.y + rect.height - 1 {
+            return None;
+        }
+        Some(offset + (row - rect.y - 1) as usize)
+    }
+
+    fn mouse_click(&mut self, col: u16, row: u16) {
+        match self.screen {
+            Screen::Home => {
+                if let Some(idx) = self.row_in(self.hit_home_list, self.hit_home_offset, col, row)
+                {
+                    if idx < self.agents.len() {
+                        if idx == self.selected {
+                            self.open_chat();
+                        } else {
+                            self.selected = idx;
+                            self.last_model = None;
+                        }
+                    }
+                }
+            }
+            Screen::PickModel => {
+                let count = match &self.models {
+                    ModelsStatus::Ok(list) => list.len(),
+                    _ => 0,
+                };
+                if let Some(idx) = self.row_in(self.hit_pick_list, self.hit_pick_offset, col, row)
+                {
+                    if idx < count {
+                        if idx == self.pick_selected {
+                            self.confirm_pick_model();
+                        } else {
+                            self.pick_selected = idx;
+                        }
+                    }
+                }
+            }
+            Screen::PickRouter => {
+                let count = self.router_rows.as_ref().map(|r| r.len()).unwrap_or(0);
+                if let Some(idx) = self.row_in(self.hit_pick_list, self.hit_pick_offset, col, row)
+                {
+                    if idx < count {
+                        if idx == self.pick_router_selected {
+                            self.confirm_pick_router();
+                        } else {
+                            self.pick_router_selected = idx;
+                        }
+                    }
+                }
+            }
+            Screen::Media => {
+                let count = self.media.as_ref().map(|m| m.models.len()).unwrap_or(0);
+                if let Some(idx) =
+                    self.row_in(self.hit_media_list, self.hit_media_offset, col, row)
+                {
+                    if idx < count {
+                        self.media_selected = idx;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse_scroll(&mut self, up: bool) {
+        match self.screen {
+            Screen::Chat => {
+                if up {
+                    self.chat_scroll = (self.chat_scroll + 3).min(self.chat_max_scroll);
+                } else {
+                    self.chat_scroll = self.chat_scroll.saturating_sub(3);
+                }
+            }
+            Screen::Home => {
+                if up {
+                    self.selected = self.selected.saturating_sub(1);
+                } else if self.selected + 1 < self.agents.len() {
+                    self.selected += 1;
+                }
+                self.last_model = None;
+            }
+            Screen::PickModel => {
+                let count = match &self.models {
+                    ModelsStatus::Ok(list) => list.len(),
+                    _ => 0,
+                };
+                if up {
+                    self.pick_selected = self.pick_selected.saturating_sub(3);
+                } else if count > 0 {
+                    self.pick_selected = (self.pick_selected + 3).min(count - 1);
+                }
+            }
+            Screen::PickRouter => {
+                let count = self.router_rows.as_ref().map(|r| r.len()).unwrap_or(0);
+                if up {
+                    self.pick_router_selected = self.pick_router_selected.saturating_sub(3);
+                } else if count > 0 {
+                    self.pick_router_selected =
+                        (self.pick_router_selected + 3).min(count - 1);
+                }
+            }
+            Screen::Media => {
+                let count = self.media.as_ref().map(|m| m.models.len()).unwrap_or(0);
+                if up {
+                    self.media_selected = self.media_selected.saturating_sub(3);
+                } else if count > 0 {
+                    self.media_selected = (self.media_selected + 3).min(count - 1);
+                }
+            }
+            Screen::Models => {
+                if up {
+                    self.models_scroll = self.models_scroll.saturating_sub(3);
+                } else {
+                    self.models_scroll += 3;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_chat(&mut self) {
+        if self.current_agent().is_some() {
+            self.chat.clear();
+            self.chat_input.clear();
+            self.last_model = None;
+            self.chat_scroll = 0;
+            self.screen = Screen::Chat;
+        }
+    }
+
+    fn confirm_pick_model(&mut self) {
+        if let (Some(agent), ModelsStatus::Ok(list)) =
+            (self.current_agent().cloned(), &self.models)
+        {
+            if let Some(chosen) = list.get(self.pick_selected) {
+                let model = chosen.name.clone();
+                match store::set_model(&agent, &model) {
+                    Ok(()) => {
+                        if let Some(a) = self.agents.get_mut(self.selected) {
+                            a.model = model.clone();
+                            a.models.retain(|m| m != &model);
+                            a.models.insert(0, model.clone());
+                        }
+                        self.status = format!("{} now runs {} — saved", agent.name, model);
+                    }
+                    Err(e) => {
+                        self.status = format!("could not save model: {e}");
+                    }
+                }
+                self.screen = Screen::Home;
+            }
+        }
+    }
+
+    fn confirm_pick_router(&mut self) {
+        if let Some(rows) = &self.router_rows {
+            if let Some(row) = rows.get(self.pick_router_selected) {
+                let value = row.value.clone();
+                if let Some(a) = self.agents.get_mut(self.selected) {
+                    a.router = value.clone();
+                    let (name, snapshot) = (a.name.clone(), a.clone());
+                    match store::save_config(&snapshot) {
+                        Ok(()) => {
+                            self.status = match &value {
+                                Some(r) => format!("{name} router: {r} (saved)"),
+                                None => format!("{name} routing off (saved)"),
+                            };
+                        }
+                        Err(e) => {
+                            self.status = format!("could not save router: {e}");
+                        }
+                    }
+                }
+                self.screen = Screen::Home;
+            }
         }
     }
 
@@ -317,6 +535,7 @@ impl App {
         }
         let state = route_state(&agent, &self.chat, &text);
         self.chat_input.clear();
+        self.chat_scroll = 0; // sending snaps back to the bottom
         self.chat.push(ChatMessage {
             role: "user".to_string(),
             content: text,
@@ -477,6 +696,16 @@ fn run_tui() -> std::io::Result<()> {
         media_busy: None,
         media_log: Vec::new(),
         media_selected: 0,
+        chat_scroll: 0,
+        chat_page: 10,
+        chat_max_scroll: 0,
+        models_scroll: 0,
+        hit_home_list: Rect::default(),
+        hit_home_offset: 0,
+        hit_pick_list: Rect::default(),
+        hit_pick_offset: 0,
+        hit_media_list: Rect::default(),
+        hit_media_offset: 0,
         chat: Vec::new(),
         chat_input: String::new(),
         streaming: false,
@@ -502,7 +731,18 @@ fn run_tui() -> std::io::Result<()> {
     // With raw mode already on, its save/restore preserves it.
     let mut terminal = ratatui::init();
     app.picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // Mouse on (Mel, 2026-11-12): clicks select, wheel scrolls —
+    // the app should feel like a regular app. Same init block as
+    // the picker, after it, for the same termios reasons.
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture
+    );
     let result = run(&mut terminal, &mut app);
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture
+    );
     ratatui::restore();
     result
 }
@@ -512,7 +752,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         app.drain_channels();
         terminal.draw(|f| ui(f, app))?;
         if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+            if let Event::Mouse(m) = ev {
+                app.handle_mouse(m);
+                continue;
+            }
+            if let Event::Key(key) = ev {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -533,13 +778,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                 }
                                 app.last_model = None;
                             }
-                            KeyCode::Enter => {
-                                if app.current_agent().is_some() {
-                                    app.chat.clear();
-                                    app.chat_input.clear();
-                                    app.last_model = None;
-                                    app.screen = Screen::Chat;
+                            KeyCode::Enter => app.open_chat(),
+                            KeyCode::PageUp => {
+                                app.selected = app.selected.saturating_sub(5);
+                                app.last_model = None;
+                            }
+                            KeyCode::PageDown => {
+                                if !app.agents.is_empty() {
+                                    app.selected =
+                                        (app.selected + 5).min(app.agents.len() - 1);
                                 }
+                                app.last_model = None;
                             }
                             KeyCode::Char('n') => {
                                 app.form = [String::new(), String::new(), String::new()];
@@ -584,6 +833,18 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                     Screen::Models => match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Home,
                         KeyCode::Char('r') => app.refresh_models(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.models_scroll = app.models_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.models_scroll += 1;
+                        }
+                        KeyCode::PageUp => {
+                            app.models_scroll = app.models_scroll.saturating_sub(10);
+                        }
+                        KeyCode::PageDown => {
+                            app.models_scroll += 10;
+                        }
                         _ => {}
                     },
                     Screen::Media => {
@@ -596,6 +857,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if app.media_selected + 1 < count {
                                     app.media_selected += 1;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                app.media_selected = app.media_selected.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                if count > 0 {
+                                    app.media_selected =
+                                        (app.media_selected + 10).min(count - 1);
                                 }
                             }
                             KeyCode::Char('r') => app.refresh_media(),
@@ -671,33 +941,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                     app.pick_selected += 1;
                                 }
                             }
-                            KeyCode::Enter => {
-                                if let (Some(agent), ModelsStatus::Ok(list)) =
-                                    (app.current_agent().cloned(), &app.models)
-                                {
-                                    if let Some(chosen) = list.get(app.pick_selected) {
-                                        let model = chosen.name.clone();
-                                        match store::set_model(&agent, &model) {
-                                            Ok(()) => {
-                                                if let Some(a) =
-                                                    app.agents.get_mut(app.selected)
-                                                {
-                                                    a.model = model.clone();
-                                                    a.models.retain(|m| m != &model);
-                                                    a.models.insert(0, model.clone());
-                                                }
-                                                app.status = format!(
-                                                    "{} now runs {} — saved",
-                                                    agent.name, model
-                                                );
-                                            }
-                                            Err(e) => {
-                                                app.status =
-                                                    format!("could not save model: {e}");
-                                            }
-                                        }
-                                        app.screen = Screen::Home;
-                                    }
+                            KeyCode::Enter => app.confirm_pick_model(),
+                            KeyCode::PageUp => {
+                                app.pick_selected = app.pick_selected.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                if count > 0 {
+                                    app.pick_selected =
+                                        (app.pick_selected + 10).min(count - 1);
                                 }
                             }
                             _ => {}
@@ -716,33 +967,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                                     app.pick_router_selected += 1;
                                 }
                             }
-                            KeyCode::Enter => {
-                                if let Some(rows) = &app.router_rows {
-                                    if let Some(row) = rows.get(app.pick_router_selected) {
-                                        let value = row.value.clone();
-                                        if let Some(a) = app.agents.get_mut(app.selected) {
-                                            a.router = value.clone();
-                                            let (name, snapshot) =
-                                                (a.name.clone(), a.clone());
-                                            match store::save_config(&snapshot) {
-                                                Ok(()) => {
-                                                    app.status = match &value {
-                                                        Some(r) => format!(
-                                                            "{name} router: {r} (saved)"
-                                                        ),
-                                                        None => format!(
-                                                            "{name} routing off (saved)"
-                                                        ),
-                                                    };
-                                                }
-                                                Err(e) => {
-                                                    app.status =
-                                                        format!("could not save router: {e}");
-                                                }
-                                            }
-                                        }
-                                        app.screen = Screen::Home;
-                                    }
+                            KeyCode::Enter => app.confirm_pick_router(),
+                            KeyCode::PageUp => {
+                                app.pick_router_selected =
+                                    app.pick_router_selected.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                if count > 0 {
+                                    app.pick_router_selected =
+                                        (app.pick_router_selected + 10).min(count - 1);
                                 }
                             }
                             _ => {}
@@ -751,6 +984,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                     Screen::Chat => match key.code {
                         KeyCode::Esc => app.screen = Screen::Home,
                         KeyCode::Enter => app.send_chat(),
+                        KeyCode::PageUp => {
+                            app.chat_scroll =
+                                (app.chat_scroll + app.chat_page.max(1)).min(app.chat_max_scroll);
+                        }
+                        KeyCode::PageDown => {
+                            app.chat_scroll =
+                                app.chat_scroll.saturating_sub(app.chat_page.max(1));
+                        }
                         KeyCode::Backspace => {
                             app.chat_input.pop();
                         }
@@ -876,7 +1117,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(status, rows[2]);
     let hints = match app.screen {
         Screen::Home => " ↑↓ pick · enter chat · e swap model · R router · n new agent · m models · g media · r refresh · q quit",
-        Screen::Chat => " enter send · esc back · ctrl+c quit",
+        Screen::Chat => " enter send · wheel / pgup scroll back · esc back · ctrl+c quit",
         Screen::Models => " r refresh · esc back",
         Screen::Media => " ↑↓ scroll · i install · L launch daemon · S stop · y link shared models · r refresh · esc back",
         Screen::NewAgent => " tab next field · enter create (on last field) · esc cancel",
@@ -908,6 +1149,8 @@ fn ui_home(f: &mut Frame, app: &mut App, area: Rect) {
         state.select(Some(app.selected));
     }
     f.render_stateful_widget(list, cols[0], &mut state);
+    app.hit_home_list = cols[0];
+    app.hit_home_offset = state.offset();
 
     let Some(agent) = app.current_agent().cloned() else {
         let p = Paragraph::new("no agents yet — press n to make one")
@@ -1049,15 +1292,26 @@ fn ui_chat(f: &mut Frame, app: &mut App, area: Rect) {
             (w / width) + 1
         })
         .sum();
-    let skip = est.saturating_sub(height.max(1));
+    // Scroll window: chat_scroll counts display lines above the
+    // bottom. 0 = the old behavior (tail pinned to the latest).
+    let page = height.max(1);
+    let max_scroll = est.saturating_sub(page);
+    app.chat_page = page;
+    app.chat_max_scroll = max_scroll;
+    if app.chat_scroll > max_scroll {
+        app.chat_scroll = max_scroll;
+    }
+    let skip = max_scroll - app.chat_scroll;
     let visible: Vec<Line> = {
         let mut acc = 0usize;
+        let mut incl = 0usize;
         let mut out = Vec::new();
         for l in lines {
             let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
             let h = (w / width) + 1;
-            if acc >= skip {
+            if acc >= skip && incl < page {
                 out.push(l);
+                incl += h;
             }
             acc += h;
         }
@@ -1105,6 +1359,8 @@ fn ui_pick_model(f: &mut Frame, app: &mut App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.pick_selected.min(models.len().saturating_sub(1))));
     f.render_stateful_widget(list, area, &mut state);
+    app.hit_pick_list = area;
+    app.hit_pick_offset = state.offset();
 }
 
 fn ui_pick_router(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1141,6 +1397,8 @@ fn ui_pick_router(f: &mut Frame, app: &mut App, area: Rect) {
         app.pick_router_selected.min(rows.len().saturating_sub(1)),
     ));
     f.render_stateful_widget(list, area, &mut state);
+    app.hit_pick_list = area;
+    app.hit_pick_offset = state.offset();
 }
 
 fn ui_media(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1256,6 +1514,8 @@ fn ui_media(f: &mut Frame, app: &mut App, area: Rect) {
         state.select(Some(app.media_selected.min(m.models.len() - 1)));
     }
     f.render_stateful_widget(list, rows[1], &mut state);
+    app.hit_media_list = rows[1];
+    app.hit_media_offset = state.offset();
 }
 
 fn ui_models(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1295,7 +1555,16 @@ fn ui_models(f: &mut Frame, app: &mut App, area: Rect) {
             if models.is_empty() {
                 lines.push(Line::from("no models installed yet — browser lands in v1"));
             }
-            let p = Paragraph::new(lines).block(block);
+            // Wheel / PgUp / PgDn scroll the table (clamped here,
+            // where the real height is known).
+            let inner_h = area.height.saturating_sub(2) as usize;
+            let max_scroll = lines.len().saturating_sub(inner_h.max(1));
+            if app.models_scroll > max_scroll {
+                app.models_scroll = max_scroll;
+            }
+            let p = Paragraph::new(lines)
+                .block(block)
+                .scroll((app.models_scroll as u16, 0));
             f.render_widget(p, area);
         }
     }
