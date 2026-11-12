@@ -15,8 +15,11 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Model file extensions the scanner recognises (ComfyUI's set).
@@ -338,63 +341,129 @@ pub fn detect_gpu() -> GpuInfo {
     }
 }
 
-/// Run comfy against OUR workspace. Every invocation carries
-/// `--workspace` — the user's own comfy default is never touched —
-/// and `--skip-prompt`, so nothing ever blocks on a question
-/// (GPU choice, analytics consent) with no terminal attached.
-fn run_comfy(args: &[&str]) -> Result<String, String> {
+/// Strip ANSI escape sequences and stray carriage returns from a
+/// line of child-process output, and cap its length — pip and
+/// comfy both emit progress-bar debris that would wreck the log.
+pub fn clean_line(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // Skip the escape sequence: optional '[' then
+                // parameter bytes up to a final letter.
+                let mut it = chars.clone();
+                if it.next() == Some('[') {
+                    let mut consumed = 1;
+                    for c2 in it.by_ref() {
+                        consumed += 1;
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                    for _ in 0..consumed {
+                        chars.next();
+                    }
+                }
+            }
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.chars().count() > 180 {
+        trimmed.chars().take(180).collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn spawn_line_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+    sink: Sender<String>,
+    acc: Arc<Mutex<Vec<String>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let buf = BufReader::new(reader);
+        for line in buf.lines() {
+            let Ok(line) = line else { break };
+            let clean = clean_line(&line);
+            if clean.is_empty() {
+                continue;
+            }
+            acc.lock().unwrap().push(clean.clone());
+            let _ = sink.send(clean);
+        }
+    })
+}
+
+/// Run comfy against OUR workspace (same `--skip-prompt` +
+/// `--workspace` discipline as everywhere), streaming each output
+/// line to `sink` as it arrives — progress feedback for long
+/// operations — and returning the full output at the end.
+pub fn run_comfy_streaming(args: &[&str], sink: &Sender<String>) -> Result<String, String> {
     let ws = workspace();
-    let out = Command::new("comfy")
+    let mut child = Command::new("comfy")
         .arg("--skip-prompt")
         .arg("--workspace")
         .arg(&ws)
         .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not run comfy: {e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let err = String::from_utf8_lossy(&out.stderr);
-    if !err.trim().is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&err);
-    }
-    if out.status.success() {
-        Ok(text.trim().to_string())
+    let acc = Arc::new(Mutex::new(Vec::new()));
+    let t_out = spawn_line_reader(
+        child.stdout.take().unwrap(),
+        sink.clone(),
+        acc.clone(),
+    );
+    let t_err = spawn_line_reader(
+        child.stderr.take().unwrap(),
+        sink.clone(),
+        acc.clone(),
+    );
+    let status = child.wait().map_err(|e| format!("comfy failed: {e}"))?;
+    let _ = t_out.join();
+    let _ = t_err.join();
+    let full = acc.lock().unwrap().join("\n");
+    if status.success() {
+        Ok(full)
     } else {
-        Err(if text.trim().is_empty() {
+        Err(if full.trim().is_empty() {
             format!("comfy {} failed", args.join(" "))
         } else {
-            text.trim().to_string()
+            full
         })
     }
 }
 
 /// Install ComfyUI into our workspace (long-running; call on a
 /// thread). The GPU flag is auto-detected — `comfy install` refuses
-/// to run unattended without one.
-pub fn install() -> Result<String, String> {
+/// to run unattended without one. Output lines stream to `sink`
+/// as they happen so the UI can show live progress.
+pub fn install(sink: Sender<String>) -> Result<String, String> {
     let gpu = detect_gpu();
     let picked = match &gpu.name {
         Some(name) => format!("{} — {name}", gpu.kind.label()),
         None => gpu.kind.label().to_string(),
     };
-    let body = run_comfy(&["install", gpu.flag()])?;
-    Ok(format!(
-        "detected GPU: {picked} → install {}\n{body}",
+    let _ = sink.send(format!(
+        "detected GPU: {picked} → install {}",
         gpu.flag()
-    ))
+    ));
+    run_comfy_streaming(&["install", gpu.flag()], &sink)
 }
 
 /// Start the daemon in the background (long-running; call on a thread).
-pub fn launch() -> Result<String, String> {
-    run_comfy(&["launch", "--background"])
+pub fn launch(sink: Sender<String>) -> Result<String, String> {
+    run_comfy_streaming(&["launch", "--background"], &sink)
 }
 
 /// Stop the background daemon.
-pub fn stop() -> Result<String, String> {
-    run_comfy(&["stop"])
+pub fn stop(sink: Sender<String>) -> Result<String, String> {
+    run_comfy_streaming(&["stop"], &sink)
 }
 
 /// The extra_model_paths.yaml body linking the install to the Comfy
@@ -579,6 +648,15 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_line_strips_ansi_and_caps_length() {
+        assert_eq!(clean_line("\u{1b}[32mhello\u{1b}[0m world"), "hello world");
+        assert_eq!(clean_line("  spaced  \r"), "spaced");
+        assert_eq!(clean_line(""), "");
+        let long = "x".repeat(300);
+        assert_eq!(clean_line(&long).chars().count(), 180);
+    }
 
     #[test]
     fn gpu_priority_discrete_beats_integrated() {

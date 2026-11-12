@@ -37,6 +37,8 @@ enum Screen {
 
 enum MediaEvent {
     Gathered(Box<comfy::ComfyStatus>),
+    /// One line of live output from a running comfy action.
+    LogLine(String),
     ActionDone {
         label: String,
         result: Result<String, String>,
@@ -130,18 +132,30 @@ impl App {
         });
     }
 
-    /// Run a comfy-cli action (install / launch / stop) on a thread;
-    /// its output lands in the media log when it finishes.
-    fn run_media_action(&mut self, label: &str, action: fn() -> Result<String, String>) {
+    /// Run a comfy-cli action (install / launch / stop) on a thread.
+    /// Output lines stream into the media log live, as progress.
+    fn run_media_action(
+        &mut self,
+        label: &str,
+        action: fn(Sender<String>) -> Result<String, String>,
+    ) {
         if self.media_busy.is_some() {
             return;
         }
         self.media_busy = Some(label.to_string());
         self.status = format!("comfy: {label}…");
+        self.media_log_push(&format!("— {label}: started"));
         let tx = self.media_tx.clone();
+        let (line_tx, line_rx) = channel::<String>();
+        let fwd_tx = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(line) = line_rx.recv() {
+                let _ = fwd_tx.send(MediaEvent::LogLine(line));
+            }
+        });
         let label = label.to_string();
         std::thread::spawn(move || {
-            let result = action();
+            let result = action(line_tx);
             let _ = tx.send(MediaEvent::ActionDone { label, result });
         });
     }
@@ -252,20 +266,26 @@ impl App {
                         self.media_selected = 0;
                     }
                 }
+                MediaEvent::LogLine(line) => {
+                    self.media_log_push(&line);
+                }
                 MediaEvent::ActionDone { label, result } => {
                     self.media_busy = None;
                     match &result {
-                        Ok(out) => {
+                        Ok(_) => {
+                            // Output already streamed into the log live.
                             self.status = format!("comfy: {label} done");
                             self.media_log_push(&format!("— {label}: ok"));
-                            if !out.trim().is_empty() {
-                                self.media_log_push(out);
-                            }
                         }
                         Err(e) => {
                             self.status = format!("comfy: {label} failed — see log");
                             self.media_log_push(&format!("— {label}: FAILED"));
-                            self.media_log_push(e);
+                            // Multi-line errors already streamed into
+                            // the log; a one-liner (e.g. spawn failure)
+                            // is the only copy, so keep it.
+                            if !e.contains('\n') {
+                                self.media_log_push(e);
+                            }
                         }
                     }
                     self.refresh_media();
@@ -1080,7 +1100,7 @@ fn ui_pick_router(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn ui_media(f: &mut Frame, app: &mut App, area: Rect) {
-    let rows = Layout::vertical([Constraint::Length(12), Constraint::Min(0)]).split(area);
+    let rows = Layout::vertical([Constraint::Length(14), Constraint::Min(0)]).split(area);
     let block = Block::default().borders(Borders::ALL).title(" comfy daemon ");
     let Some(m) = &app.media else {
         let p = Paragraph::new("looking for comfy…").block(block);
@@ -1147,7 +1167,7 @@ fn ui_media(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(PINK),
         )));
     }
-    let log_room = 12usize.saturating_sub(lines.len() + 2);
+    let log_room = 14usize.saturating_sub(lines.len() + 2);
     if log_room > 0 && !app.media_log.is_empty() {
         lines.push(Line::from(""));
         for l in app.media_log.iter().rev().take(log_room).rev() {
