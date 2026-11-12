@@ -784,6 +784,12 @@ fn ollama_status(app: &App) -> (String, Color) {
 }
 
 fn comfy_status(app: &App) -> (String, Color) {
+    // An install in flight gets its own header state (Mel's ask,
+    // 2026-11-12): yellow, so "something is happening" reads at a
+    // glance even from across the room.
+    if app.media_busy.as_deref() == Some("installing ComfyUI") {
+        return ("comfy: ○ installing...".to_string(), Color::Yellow);
+    }
     match &app.media {
         None => ("comfy: …".to_string(), DIM),
         Some(m) if m.server_up => ("comfy: ● daemon up".to_string(), Color::Green),
