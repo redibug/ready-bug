@@ -154,6 +154,20 @@ server-rendered and parseable, so the browser is:
 
 ## Media: image & video generation via ComfyUI
 
+**Engine arrangement (decided 2026-11-11, daemon layer SHIPPED):**
+the server is a comfy-cli-managed headless install in a dedicated
+workspace — `~/comfy/ReadyBug` (Windows `C:/Users/<user>/comfy/ReadyBug`)
+— shared by Ready Bug, the text adventure games, and future apps.
+Every comfy invocation from our code passes `--workspace` explicitly;
+the user's own comfy-cli default is NEVER changed (no `set-default`).
+The Media screen (**g**) detects comfy-cli, installs/launches/stops
+the daemon (`comfy launch --background` / `comfy stop`), writes the
+`extra_model_paths.yaml` linking the install to Comfy Desktop's shared
+library (one model library, no duplicates), and lists scanned models
+with duplicate warnings — dedupe is the user's responsibility, the
+app only warns. Comfy Desktop remains the tool for visually building
+workflows. Generation (below) drives whichever server answers :8188.
+
 Ready Bug does **not** reimplement diffusion. It drives a ComfyUI
 server (Desktop or standalone) through its official API:
 

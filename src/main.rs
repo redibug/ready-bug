@@ -1,8 +1,9 @@
 //! Ready Bug v0 — agent-first local AI command center.
 //!
-//! Screens: Agents (home) · Chat · Models (Ollama) · New Agent.
+//! Screens: Agents (home) · Chat · Models (Ollama) · Media (ComfyUI) · New Agent.
 //! See DESIGN.md for where this is all going.
 
+mod comfy;
 mod ollama;
 mod store;
 
@@ -28,9 +29,18 @@ enum Screen {
     Home,
     Chat,
     Models,
+    Media,
     NewAgent,
     PickModel,
     PickRouter,
+}
+
+enum MediaEvent {
+    Gathered(Box<comfy::ComfyStatus>),
+    ActionDone {
+        label: String,
+        result: Result<String, String>,
+    },
 }
 
 struct RouterRow {
@@ -77,6 +87,12 @@ struct App {
     models: ModelsStatus,
     models_rx: Receiver<Result<Vec<ModelInfo>, String>>,
     models_tx: Sender<Result<Vec<ModelInfo>, String>>,
+    media: Option<comfy::ComfyStatus>,
+    media_rx: Receiver<MediaEvent>,
+    media_tx: Sender<MediaEvent>,
+    media_busy: Option<String>,
+    media_log: Vec<String>,
+    media_selected: usize,
     chat: Vec<ChatMessage>,
     chat_input: String,
     streaming: bool,
@@ -105,6 +121,39 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(ollama::fetch_models());
         });
+    }
+
+    fn refresh_media(&mut self) {
+        let tx = self.media_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(MediaEvent::Gathered(Box::new(comfy::gather())));
+        });
+    }
+
+    /// Run a comfy-cli action (install / launch / stop) on a thread;
+    /// its output lands in the media log when it finishes.
+    fn run_media_action(&mut self, label: &str, action: fn() -> Result<String, String>) {
+        if self.media_busy.is_some() {
+            return;
+        }
+        self.media_busy = Some(label.to_string());
+        self.status = format!("comfy: {label}…");
+        let tx = self.media_tx.clone();
+        let label = label.to_string();
+        std::thread::spawn(move || {
+            let result = action();
+            let _ = tx.send(MediaEvent::ActionDone { label, result });
+        });
+    }
+
+    fn media_log_push(&mut self, line: &str) {
+        for l in line.lines() {
+            self.media_log.push(l.to_string());
+        }
+        let excess = self.media_log.len().saturating_sub(60);
+        if excess > 0 {
+            self.media_log.drain(..excess);
+        }
     }
 
     fn drain_channels(&mut self) {
@@ -187,6 +236,40 @@ impl App {
             if let Ok(rows) = rx.try_recv() {
                 self.router_rows = Some(rows);
                 self.router_rx = None;
+            }
+        }
+        while let Ok(ev) = self.media_rx.try_recv() {
+            match ev {
+                MediaEvent::Gathered(status) => {
+                    self.media = Some(*status);
+                    if self.media_selected
+                        >= self
+                            .media
+                            .as_ref()
+                            .map(|m| m.models.len())
+                            .unwrap_or(0)
+                    {
+                        self.media_selected = 0;
+                    }
+                }
+                MediaEvent::ActionDone { label, result } => {
+                    self.media_busy = None;
+                    match &result {
+                        Ok(out) => {
+                            self.status = format!("comfy: {label} done");
+                            self.media_log_push(&format!("— {label}: ok"));
+                            if !out.trim().is_empty() {
+                                self.media_log_push(out);
+                            }
+                        }
+                        Err(e) => {
+                            self.status = format!("comfy: {label} failed — see log");
+                            self.media_log_push(&format!("— {label}: FAILED"));
+                            self.media_log_push(e);
+                        }
+                    }
+                    self.refresh_media();
+                }
             }
         }
     }
@@ -322,6 +405,7 @@ fn main() -> std::io::Result<()> {
         eprintln!("warning: could not prepare data dir: {e}");
     }
     let (models_tx, models_rx) = channel();
+    let (media_tx, media_rx) = channel();
     let mut app = App {
         screen: Screen::Home,
         agents: store::load_agents(),
@@ -329,6 +413,12 @@ fn main() -> std::io::Result<()> {
         models: ModelsStatus::Loading,
         models_rx,
         models_tx,
+        media: None,
+        media_rx,
+        media_tx,
+        media_busy: None,
+        media_log: Vec::new(),
+        media_selected: 0,
         chat: Vec::new(),
         chat_input: String::new(),
         streaming: false,
@@ -346,6 +436,7 @@ fn main() -> std::io::Result<()> {
         avatar_cache: None,
     };
     app.refresh_models();
+    app.refresh_media();
 
     // Init first, THEN query the terminal's graphics protocol: the picker
     // query saves/restores termios itself, and if it restores after raw
@@ -424,6 +515,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                             }
                             KeyCode::Char('R') => app.open_router_picker(),
                             KeyCode::Char('m') => app.screen = Screen::Models,
+                            KeyCode::Char('g') => {
+                                app.refresh_media();
+                                app.screen = Screen::Media;
+                            }
                             KeyCode::Char('r') => app.refresh_models(),
                             _ => {}
                         }
@@ -433,6 +528,76 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                         KeyCode::Char('r') => app.refresh_models(),
                         _ => {}
                     },
+                    Screen::Media => {
+                        let count = app.media.as_ref().map(|m| m.models.len()).unwrap_or(0);
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Home,
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.media_selected = app.media_selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.media_selected + 1 < count {
+                                    app.media_selected += 1;
+                                }
+                            }
+                            KeyCode::Char('r') => app.refresh_media(),
+                            KeyCode::Char('i') => {
+                                match app.media.as_ref() {
+                                    Some(m) if m.cli_version.is_none() => {
+                                        app.status =
+                                            "comfy-cli not found — install it first: pip install comfy-cli"
+                                                .to_string();
+                                    }
+                                    Some(m) if m.installed => {
+                                        app.status =
+                                            "workspace already installed".to_string();
+                                    }
+                                    _ => app.run_media_action("installing ComfyUI", comfy::install),
+                                }
+                            }
+                            KeyCode::Char('L') => {
+                                match app.media.as_ref() {
+                                    Some(m) if m.server_up => {
+                                        app.status = "comfy daemon already running".to_string();
+                                    }
+                                    Some(m) if !m.installed => {
+                                        app.status =
+                                            "install the workspace first (i)".to_string();
+                                    }
+                                    _ => app.run_media_action("starting daemon", comfy::launch),
+                                }
+                            }
+                            KeyCode::Char('S') => {
+                                match app.media.as_ref() {
+                                    Some(m) if !m.server_up => {
+                                        app.status = "comfy daemon is not running".to_string();
+                                    }
+                                    _ => app.run_media_action("stopping daemon", comfy::stop),
+                                }
+                            }
+                            KeyCode::Char('y') => {
+                                if app.media_busy.is_none() {
+                                    match comfy::write_yaml() {
+                                        Ok(path) => {
+                                            app.status = format!(
+                                                "model paths linked: {}",
+                                                path.display()
+                                            );
+                                            app.media_log_push(&format!(
+                                                "— yaml written: {}",
+                                                path.display()
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            app.status = format!("yaml: {e}");
+                                        }
+                                    }
+                                    app.refresh_media();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     Screen::PickModel => {
                         let count = match &app.models {
                             ModelsStatus::Ok(list) => list.len(),
@@ -598,6 +763,15 @@ fn ollama_status(app: &App) -> (String, Color) {
     }
 }
 
+fn comfy_status(app: &App) -> (String, Color) {
+    match &app.media {
+        None => ("comfy: …".to_string(), DIM),
+        Some(m) if m.server_up => ("comfy: ● daemon up".to_string(), Color::Green),
+        Some(m) if m.installed => ("comfy: ○ daemon off".to_string(), DIM),
+        Some(_) => ("comfy: ○ not installed".to_string(), Color::Red),
+    }
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
     // No minimum-size gate: render at whatever size the terminal is.
     // Layout may look squished when tiny, but it always displays.
@@ -611,6 +785,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     .split(area);
 
     let (stat, stat_color) = ollama_status(app);
+    let (cstat, cstat_color) = comfy_status(app);
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             " READY BUG ",
@@ -618,6 +793,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         ),
         Span::raw("  agent command center   "),
         Span::styled(stat, Style::default().fg(stat_color)),
+        Span::raw("   "),
+        Span::styled(cstat, Style::default().fg(cstat_color)),
     ]));
     f.render_widget(header, rows[0]);
 
@@ -625,6 +802,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         Screen::Home => ui_home(f, app, rows[1]),
         Screen::Chat => ui_chat(f, app, rows[1]),
         Screen::Models => ui_models(f, app, rows[1]),
+        Screen::Media => ui_media(f, app, rows[1]),
         Screen::NewAgent => ui_new_agent(f, app, rows[1]),
         Screen::PickModel => ui_pick_model(f, app, rows[1]),
         Screen::PickRouter => ui_pick_router(f, app, rows[1]),
@@ -633,9 +811,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     let status = Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(DIM));
     f.render_widget(status, rows[2]);
     let hints = match app.screen {
-        Screen::Home => " ↑↓ pick · enter chat · e swap model · R router · n new agent · m models · r refresh · q quit",
+        Screen::Home => " ↑↓ pick · enter chat · e swap model · R router · n new agent · m models · g media · r refresh · q quit",
         Screen::Chat => " enter send · esc back · ctrl+c quit",
         Screen::Models => " r refresh · esc back",
+        Screen::Media => " ↑↓ scroll · i install · L launch daemon · S stop · y link shared models · r refresh · esc back",
         Screen::NewAgent => " tab next field · enter create (on last field) · esc cancel",
         Screen::PickModel => " ↑↓ pick · enter use this model · esc cancel",
         Screen::PickRouter => " ↑↓ pick · enter use this router · esc cancel",
@@ -898,6 +1077,114 @@ fn ui_pick_router(f: &mut Frame, app: &mut App, area: Rect) {
         app.pick_router_selected.min(rows.len().saturating_sub(1)),
     ));
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn ui_media(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::vertical([Constraint::Length(12), Constraint::Min(0)]).split(area);
+    let block = Block::default().borders(Borders::ALL).title(" comfy daemon ");
+    let Some(m) = &app.media else {
+        let p = Paragraph::new("looking for comfy…").block(block);
+        f.render_widget(p, rows[0]);
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &m.cli_version {
+        Some(v) => lines.push(Line::from(format!("comfy-cli:  {v}"))),
+        None => lines.push(Line::from(vec![
+            Span::styled("comfy-cli:  NOT FOUND", Style::default().fg(Color::Red)),
+            Span::raw("  — install it with: pip install comfy-cli"),
+        ])),
+    }
+    lines.push(Line::from(format!(
+        "workspace:  {}  ({})",
+        m.workspace.display(),
+        if m.installed { "installed" } else { "not installed — i to install" }
+    )));
+    if m.server_up {
+        lines.push(Line::from(vec![
+            Span::styled("daemon:     ● running", Style::default().fg(Color::Green)),
+            Span::raw(format!("  {}", m.server_url)),
+        ]));
+    } else {
+        lines.push(Line::from(
+            "daemon:     ○ not running  (L to launch, once installed)",
+        ));
+    }
+    match &m.shared_dir {
+        Some(d) => lines.push(Line::from(format!("shared lib: {}", d.display()))),
+        None => lines.push(Line::from(
+            "shared lib: no Comfy Desktop shared library found",
+        )),
+    }
+    lines.push(Line::from(format!(
+        "model yaml: {}",
+        if m.yaml_linked {
+            "linked — the daemon reads the shared library"
+        } else {
+            "not linked — y writes extra_model_paths.yaml"
+        }
+    )));
+    if m.duplicate_count > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "⚠ {} file(s) look like duplicates (same name + size in 2+ places) — yours to sort out",
+                m.duplicate_count
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(busy) = &app.media_busy {
+        lines.push(Line::from(Span::styled(
+            format!("⏳ {busy}…"),
+            Style::default().fg(PINK),
+        )));
+    }
+    let log_room = 12usize.saturating_sub(lines.len() + 2);
+    if log_room > 0 && !app.media_log.is_empty() {
+        lines.push(Line::from(""));
+        for l in app.media_log.iter().rev().take(log_room).rev() {
+            lines.push(Line::from(Span::styled(
+                format!("  {l}"),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, rows[0]);
+
+    let items: Vec<ListItem> = m
+        .models
+        .iter()
+        .map(|mm| {
+            let mut spans = vec![
+                Span::styled(format!("{:<16}", mm.category), Style::default().fg(DIM)),
+                Span::raw(format!(" {:<44}", mm.name)),
+                Span::styled(
+                    format!("{:>10}", comfy::format_size(mm.size)),
+                    Style::default().fg(DIM),
+                ),
+                Span::raw(format!("  [{}]", mm.source)),
+            ];
+            if mm.duplicate {
+                spans.push(Span::styled(
+                    "  ⚠ dup",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let title = format!(" image / video models ({}) ", m.models.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().fg(Color::Black).bg(PINK))
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    if !m.models.is_empty() {
+        state.select(Some(app.media_selected.min(m.models.len() - 1)));
+    }
+    f.render_stateful_widget(list, rows[1], &mut state);
 }
 
 fn ui_models(f: &mut Frame, app: &mut App, area: Rect) {

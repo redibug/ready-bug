@@ -16,9 +16,16 @@ See [DESIGN.md](DESIGN.md) for the full design.
   lessons, plus a shared operator profile
 - Avatars rendered with ratatui-image (Kitty / Sixel / iTerm2 where
   available, halfblocks fallback everywhere else)
+- Media screen (**g**): a headless ComfyUI daemon managed through
+  comfy-cli in a dedicated workspace (`~/comfy/ReadyBug`, passed with
+  `--workspace` on every command — your own comfy default is never
+  touched). Install / launch / stop it from the app, link it to Comfy
+  Desktop's shared model library (writes `extra_model_paths.yaml`),
+  and browse every image/video model the scanner finds there.
+  Duplicate files are flagged, never deleted — your files, your call.
 
 Coming later (per DESIGN.md): Ollama model browser + pull/delete,
-ComfyUI media library scan, generation, video.
+ComfyUI generation, video.
 
 ## Build & run
 
