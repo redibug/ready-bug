@@ -60,6 +60,26 @@ cargo build --release  # optimized build
 First `cargo run` downloads the libraries and compiles everything
 (a few minutes); after that only changed code rebuilds.
 
+## The `readybug` CLI (for games & scripts)
+
+The same codebase also builds a small CLI, `readybug` — the shared
+setup surface so other programs (our text adventure games, future
+apps) never carry their own copy of the install logic:
+
+```bash
+readybug install          # prerequisites (Ollama, Python 3.13, comfy-cli)
+                          # + ComfyUI into the shared workspace + link the
+                          # Comfy Desktop shared model library
+readybug doctor           # what's present / missing (--json for machines)
+readybug comfy status     # workspace, daemon, models (--json too)
+readybug comfy launch     # start the ComfyUI daemon
+readybug comfy stop       # stop it
+```
+
+Games depend on the `ready_bug` library for runtime questions and
+shell out to this CLI for setup. Building both binaries is just
+`cargo build` (they land in `target/<profile>/` together).
+
 **Tips**
 
 - Run it in a graphics-capable terminal for full-quality avatars:

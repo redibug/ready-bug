@@ -173,7 +173,7 @@ pub fn extra_scan_dirs() -> Vec<PathBuf> {
     std::env::split_paths(&d).filter(|p| p.is_dir()).collect()
 }
 
-fn cli_version() -> Option<String> {
+pub fn cli_version() -> Option<String> {
     let out = Command::new("comfy")
         .arg("--version")
         .stdin(Stdio::null())

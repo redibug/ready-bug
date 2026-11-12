@@ -3,9 +3,8 @@
 //! Screens: Agents (home) · Chat · Models (Ollama) · Media (ComfyUI) · New Agent.
 //! See DESIGN.md for where this is all going.
 
-mod comfy;
-mod ollama;
 mod store;
+use ready_bug::{comfy, ollama};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ollama::{ChatEvent, ChatMessage, ModelInfo};

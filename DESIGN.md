@@ -174,6 +174,46 @@ with duplicate warnings — dedupe is the user's responsibility, the
 app only warns. Comfy Desktop remains the tool for visually building
 workflows. Generation (below) drives whichever server answers :8188.
 
+## Ready Bug as a platform: shared library + CLI (Mel's idea, 2026-11-12)
+
+Future games/apps must NOT each carry their own copy of the setup
+logic (prereqs, comfy workspace, daemon, shared library). Instead:
+
+- **Split the crate**: a `readybug-core` library (the comfy module,
+  the ollama client, paths — everything UI-free) + the TUI binary +
+  a **`readybug` CLI** binary. Games depend on the library for
+  runtime questions (where's the workspace? is the daemon up?) and
+  shell out to the CLI for setup.
+- **`readybug install`** (the CLI's centerpiece): idempotent
+  bootstrap — check/install prerequisites (**Ollama**, **Python
+  3.13**, **comfy-cli**), then run the exact comfy install the TUI
+  runs (GPU detect, dedicated workspace, shared-library yaml).
+  Per-user installs only, so no admin/UAC. Platform routes differ
+  (Windows: winget or the vendors' per-user installers; Linux:
+  the distro's packages).
+- **Game bootstrap flow**: the game checks for a usable `readybug`
+  (its managed location first, then PATH, with a minimum version).
+  Missing/too old → download the CLI from **GitHub Releases**
+  (`releases/latest/download/…` — Vercel is for web things, not
+  binary releases) → run `readybug install` → play. Never silently
+  upgrade a working setup.
+- CLI sketch: `install`, `doctor` (what's present/missing),
+  `comfy status|launch|stop`, `--version`; `--json` on the
+  reporting commands since games are the consumers.
+- Status: **SHIPPED 2026-11-12 (v0.2.0)** on Mel's word. Single
+  package, three targets: `ready_bug` lib (comfy, ollama, setup),
+  the TUI bin, and `src/bin/readybug.rs`. Prereq installs live in
+  `setup.rs`: checks + per-user install routes (winget for Ollama
+  and Python 3.13 on Windows, brew on macOS, the official script
+  for Ollama on Linux; comfy-cli via pip), each step verified by
+  re-checking. `readybug install` = prereqs → comfy install
+  (skipped if already installed) → shared-library yaml link.
+  Verified end-to-end against mocks (doctor/status text + JSON,
+  install + idempotent re-run, launch/status/stop); the TUI still
+  passes its tmux smoke test. NOT yet: GitHub Releases publishing
+  (the games' download source) and the game-side bootstrap shim —
+  those land when the first game integrates.
+
 Ready Bug does **not** reimplement diffusion. It drives a ComfyUI
 server (Desktop or standalone) through its official API:
 
