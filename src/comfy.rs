@@ -71,6 +71,8 @@ pub struct ComfyStatus {
     pub shared_dir: Option<PathBuf>,
     /// extra_model_paths.yaml already points at the shared library.
     pub yaml_linked: bool,
+    /// GPU an install would target on this machine.
+    pub gpu: GpuInfo,
     pub models: Vec<MediaModel>,
     pub duplicate_count: usize,
 }
@@ -179,11 +181,171 @@ fn server_up() -> bool {
         .unwrap_or(false)
 }
 
+/// What kind of GPU `comfy install` should target. Detection order
+/// matters on hybrid laptops: a discrete card always beats an
+/// integrated one, whatever order the OS lists them in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuKind {
+    Nvidia,
+    Amd,
+    IntelArc,
+    AppleSilicon,
+    Cpu,
+}
+
+impl GpuKind {
+    /// The `comfy install` flag for this kind.
+    pub fn flag(&self) -> &'static str {
+        match self {
+            GpuKind::Nvidia => "--nvidia",
+            GpuKind::Amd => "--amd",
+            GpuKind::IntelArc => "--intel-arc",
+            GpuKind::AppleSilicon => "--m-series",
+            GpuKind::Cpu => "--cpu",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            GpuKind::Nvidia => "NVIDIA",
+            GpuKind::Amd => "AMD",
+            GpuKind::IntelArc => "Intel Arc",
+            GpuKind::AppleSilicon => "Apple silicon",
+            GpuKind::Cpu => "CPU only",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    pub kind: GpuKind,
+    /// Adapter name when the OS told us one (display only).
+    pub name: Option<String>,
+}
+
+impl GpuInfo {
+    pub fn flag(&self) -> &'static str {
+        self.kind.flag()
+    }
+}
+
+/// Pick a GPU kind from a list of adapter names: NVIDIA first, then
+/// AMD/Radeon, then Intel Arc. Integrated Intel/AMD graphics alone
+/// don't count — those machines get the CPU build.
+pub fn gpu_from_names(names: &[String]) -> Option<(GpuKind, String)> {
+    let find = |needles: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find(|n| {
+                let low = n.to_lowercase();
+                needles.iter().any(|k| low.contains(k))
+            })
+            .cloned()
+    };
+    if let Some(n) = find(&["nvidia", "geforce", "quadro", "tesla"]) {
+        return Some((GpuKind::Nvidia, n));
+    }
+    if let Some(n) = find(&["amd", "radeon"]) {
+        // An AMD APU's integrated Radeon is not a ROCm/DirectML target
+        // worth picking over CPU unless it looks discrete; the name
+        // alone can't tell, so AMD names count (discrete or APU) —
+        // comfy's AMD build still beats CPU torch on an APU.
+        return Some((GpuKind::Amd, n));
+    }
+    if let Some(n) = find(&["intel arc", "arc a", "arc b"]) {
+        return Some((GpuKind::IntelArc, n));
+    }
+    None
+}
+
+fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Display adapter names from the OS (Windows: CIM via PowerShell;
+/// Linux: lspci). Empty when the query isn't available.
+fn adapter_names() -> Vec<String> {
+    if cfg!(windows) {
+        if let Some(text) = run_capture(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+            ],
+        ) {
+            return text
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+        return Vec::new();
+    }
+    if let Some(text) = run_capture("lspci", &[]) {
+        return text
+            .lines()
+            .filter(|l| {
+                let low = l.to_lowercase();
+                low.contains("vga") || low.contains("3d controller") || low.contains("display")
+            })
+            .map(|l| l.trim().to_string())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Detect the GPU `comfy install` should target. nvidia-smi is the
+/// ground truth for NVIDIA; Apple silicon is a platform fact;
+/// everything else reads the OS adapter list. Falls back to CPU —
+/// slow, but it installs anywhere.
+pub fn detect_gpu() -> GpuInfo {
+    if let Some(text) = run_capture(
+        "nvidia-smi",
+        &["--query-gpu=name", "--format=csv,noheader"],
+    ) {
+        let name = text.lines().next().map(|l| l.trim().to_string());
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            return GpuInfo {
+                kind: GpuKind::Nvidia,
+                name: Some(name),
+            };
+        }
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return GpuInfo {
+            kind: GpuKind::AppleSilicon,
+            name: Some("Apple silicon (MPS)".to_string()),
+        };
+    }
+    if let Some((kind, name)) = gpu_from_names(&adapter_names()) {
+        return GpuInfo {
+            kind,
+            name: Some(name),
+        };
+    }
+    GpuInfo {
+        kind: GpuKind::Cpu,
+        name: None,
+    }
+}
+
 /// Run comfy against OUR workspace. Every invocation carries
-/// `--workspace` — the user's own comfy default is never touched.
+/// `--workspace` — the user's own comfy default is never touched —
+/// and `--skip-prompt`, so nothing ever blocks on a question
+/// (GPU choice, analytics consent) with no terminal attached.
 fn run_comfy(args: &[&str]) -> Result<String, String> {
     let ws = workspace();
     let out = Command::new("comfy")
+        .arg("--skip-prompt")
         .arg("--workspace")
         .arg(&ws)
         .args(args)
@@ -209,9 +371,20 @@ fn run_comfy(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Install ComfyUI into our workspace (long-running; call on a thread).
+/// Install ComfyUI into our workspace (long-running; call on a
+/// thread). The GPU flag is auto-detected — `comfy install` refuses
+/// to run unattended without one.
 pub fn install() -> Result<String, String> {
-    run_comfy(&["install"])
+    let gpu = detect_gpu();
+    let picked = match &gpu.name {
+        Some(name) => format!("{} — {name}", gpu.kind.label()),
+        None => gpu.kind.label().to_string(),
+    };
+    let body = run_comfy(&["install", gpu.flag()])?;
+    Ok(format!(
+        "detected GPU: {picked} → install {}\n{body}",
+        gpu.flag()
+    ))
 }
 
 /// Start the daemon in the background (long-running; call on a thread).
@@ -392,6 +565,7 @@ pub fn gather() -> ComfyStatus {
         server_url: server_url(),
         shared_dir: shared_models_dir(),
         yaml_linked: yaml_linked(),
+        gpu: detect_gpu(),
         models,
         duplicate_count,
     }
@@ -405,6 +579,33 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_priority_discrete_beats_integrated() {
+        let hybrid = vec![
+            "Intel(R) UHD Graphics".to_string(),
+            "NVIDIA GeForce RTX 3060 Laptop GPU".to_string(),
+        ];
+        let (kind, name) = gpu_from_names(&hybrid).unwrap();
+        assert_eq!(kind, GpuKind::Nvidia);
+        assert!(name.contains("RTX 3060"));
+        assert_eq!(kind.flag(), "--nvidia");
+
+        let amd = vec!["AMD Radeon RX 7800 XT".to_string()];
+        assert_eq!(gpu_from_names(&amd).unwrap().0, GpuKind::Amd);
+
+        let arc = vec!["Intel Arc A770".to_string()];
+        let (kind, _) = gpu_from_names(&arc).unwrap();
+        assert_eq!(kind, GpuKind::IntelArc);
+        assert_eq!(kind.flag(), "--intel-arc");
+
+        // Integrated-only machines fall back to CPU.
+        let igpu = vec!["Intel(R) Iris(R) Xe Graphics".to_string()];
+        assert!(gpu_from_names(&igpu).is_none());
+        assert!(gpu_from_names(&[]).is_none());
+        assert_eq!(GpuKind::AppleSilicon.flag(), "--m-series");
+        assert_eq!(GpuKind::Cpu.flag(), "--cpu");
+    }
 
     #[test]
     fn yaml_points_at_shared_with_categories() {

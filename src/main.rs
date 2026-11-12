@@ -1101,6 +1101,13 @@ fn ui_media(f: &mut Frame, app: &mut App, area: Rect) {
         m.workspace.display(),
         if m.installed { "installed" } else { "not installed — i to install" }
     )));
+    lines.push(Line::from(match &m.gpu.name {
+        Some(name) => format!("gpu:        {name}  (install {})", m.gpu.flag()),
+        None => format!(
+            "gpu:        none detected  (install {})",
+            m.gpu.flag()
+        ),
+    }));
     if m.server_up {
         lines.push(Line::from(vec![
             Span::styled("daemon:     ● running", Style::default().fg(Color::Green)),
