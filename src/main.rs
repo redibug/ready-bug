@@ -276,6 +276,19 @@ impl App {
                             // Output already streamed into the log live.
                             self.status = format!("comfy: {label} done");
                             self.media_log_push(&format!("— {label}: ok"));
+                            // Patch the known outcome into the current
+                            // state immediately, so the header goes
+                            // installing... → daemon off directly
+                            // instead of flashing the stale pre-action
+                            // state while the refresh gathers (Mel,
+                            // 2026-11-12). The gather still confirms.
+                            if let Some(m) = &mut self.media {
+                                match label.as_str() {
+                                    "installing ComfyUI" => m.installed = true,
+                                    "stopping daemon" => m.server_up = false,
+                                    _ => {}
+                                }
+                            }
                         }
                         Err(e) => {
                             self.status = format!("comfy: {label} failed — see log");
