@@ -94,14 +94,35 @@ pub fn workspace() -> PathBuf {
     PathBuf::from("comfy").join("ReadyBug")
 }
 
-/// The ComfyUI install inside the workspace.
-pub fn comfyui_dir() -> PathBuf {
-    workspace().join("ComfyUI")
+/// Where the ComfyUI install actually lives. comfy-cli's layout has
+/// changed across versions: old releases installed into a `ComfyUI/`
+/// subfolder of the workspace, current ones (seen with 1.26) install
+/// directly INTO the workspace root. Detect by looking for `main.py`
+/// instead of assuming a layout.
+pub fn comfyui_dir() -> Option<PathBuf> {
+    let ws = workspace();
+    let candidates = [
+        ws.clone(),
+        ws.join("ComfyUI"),
+        ws.join("comfy").join("ComfyUI"),
+    ];
+    for c in candidates {
+        if c.join("main.py").is_file() {
+            return Some(c);
+        }
+    }
+    // Mid-install fallback: the classic subfolder existing at all is
+    // a signal until main.py lands.
+    let classic = ws.join("ComfyUI");
+    if classic.is_dir() {
+        return Some(classic);
+    }
+    None
 }
 
 /// Where a workspace's own (unshared) models would live.
-pub fn workspace_models_dir() -> PathBuf {
-    comfyui_dir().join("models")
+pub fn workspace_models_dir() -> Option<PathBuf> {
+    comfyui_dir().map(|d| d.join("models"))
 }
 
 /// The ComfyUI server the daemon serves. COMFY_HOST overrides, in the
@@ -163,10 +184,23 @@ fn cli_version() -> Option<String> {
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if text.is_empty() {
-        Some("found".to_string())
-    } else {
-        Some(text)
+        return Some("found".to_string());
     }
+    // comfy-cli 1.26 answers --version with a JSON envelope; older
+    // versions print a plain version string.
+    if text.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            let ver = v
+                .get("data")
+                .and_then(|d| d.get("version"))
+                .or_else(|| v.get("version"))
+                .and_then(|s| s.as_str());
+            if let Some(ver) = ver {
+                return Some(ver.to_string());
+            }
+        }
+    }
+    Some(text)
 }
 
 fn server_up() -> bool {
@@ -493,13 +527,14 @@ pub fn yaml_content(shared: &Path) -> String {
     s
 }
 
-pub fn yaml_path() -> PathBuf {
-    comfyui_dir().join("extra_model_paths.yaml")
+pub fn yaml_path() -> Option<PathBuf> {
+    comfyui_dir().map(|d| d.join("extra_model_paths.yaml"))
 }
 
 /// True when the install's yaml already links the shared library.
 pub fn yaml_linked() -> bool {
-    let Ok(text) = fs::read_to_string(yaml_path()) else {
+    let Some(path) = yaml_path() else { return false };
+    let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
     text.contains("desktop_shared")
@@ -508,13 +543,12 @@ pub fn yaml_linked() -> bool {
 /// Write the yaml. Refuses before the workspace is installed —
 /// creating a stray ComfyUI folder first would confuse `comfy install`.
 pub fn write_yaml() -> Result<PathBuf, String> {
-    let dir = comfyui_dir();
-    if !dir.is_dir() {
+    let Some(_dir) = comfyui_dir() else {
         return Err("workspace not installed yet — install first (i)".to_string());
-    }
+    };
     let shared = shared_models_dir()
         .ok_or_else(|| "no Comfy Desktop shared library found on this machine".to_string())?;
-    let path = yaml_path();
+    let path = yaml_path().expect("comfyui_dir checked above");
     fs::write(&path, yaml_content(&shared)).map_err(|e| format!("could not write yaml: {e}"))?;
     Ok(path)
 }
@@ -561,9 +595,10 @@ pub fn scan_models() -> Vec<MediaModel> {
     if let Some(shared) = shared_models_dir() {
         roots.push((shared, "Comfy Desktop shared".to_string()));
     }
-    let ws_models = workspace_models_dir();
-    if ws_models.is_dir() {
-        roots.push((ws_models, "ReadyBug workspace".to_string()));
+    if let Some(ws_models) = workspace_models_dir() {
+        if ws_models.is_dir() {
+            roots.push((ws_models, "ReadyBug workspace".to_string()));
+        }
     }
     for extra in extra_scan_dirs() {
         let label = format!("extra: {}", extra.display());
@@ -629,7 +664,7 @@ pub fn gather() -> ComfyStatus {
     ComfyStatus {
         cli_version: cli_version(),
         workspace: workspace(),
-        installed: comfyui_dir().is_dir(),
+        installed: comfyui_dir().is_some(),
         server_up: server_up(),
         server_url: server_url(),
         shared_dir: shared_models_dir(),
@@ -729,6 +764,32 @@ mod tests {
         assert!(models.iter().all(|m| m.name != "notes.txt"));
         let ckpt = models.iter().find(|m| m.name == "flux.safetensors").unwrap();
         assert_eq!(ckpt.category, "checkpoints");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn comfyui_dir_detects_both_layouts() {
+        let base = std::env::temp_dir().join(format!("rb-layout-test-{}", std::process::id()));
+        // Current comfy-cli: ComfyUI installs into the workspace root.
+        let root_ws = base.join("rootws");
+        fs::create_dir_all(&root_ws).unwrap();
+        fs::write(root_ws.join("main.py"), b"# comfy").unwrap();
+        // Older comfy-cli: a ComfyUI subfolder inside the workspace.
+        let sub_ws = base.join("subws");
+        fs::create_dir_all(sub_ws.join("ComfyUI")).unwrap();
+        fs::write(sub_ws.join("ComfyUI").join("main.py"), b"# comfy").unwrap();
+        // Nothing installed.
+        let empty_ws = base.join("emptyws");
+        fs::create_dir_all(&empty_ws).unwrap();
+
+        // SAFETY: only this test sets this variable.
+        unsafe { std::env::set_var("READYBUG_COMFY_WORKSPACE", &root_ws) };
+        assert_eq!(comfyui_dir(), Some(root_ws.clone()));
+        unsafe { std::env::set_var("READYBUG_COMFY_WORKSPACE", &sub_ws) };
+        assert_eq!(comfyui_dir(), Some(sub_ws.join("ComfyUI")));
+        unsafe { std::env::set_var("READYBUG_COMFY_WORKSPACE", &empty_ws) };
+        assert_eq!(comfyui_dir(), None);
+        unsafe { std::env::remove_var("READYBUG_COMFY_WORKSPACE") };
         let _ = fs::remove_dir_all(&base);
     }
 }
